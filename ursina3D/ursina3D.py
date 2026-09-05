@@ -21,6 +21,8 @@ DISTANCIA_VISAO = 3
 cache_mapa = {}
 chunks_entidades = {}
 chunks_gerados = set()
+# Chunks são construídos em pequenos lotes para não travar ao caminhar.
+chunks_pendentes = set()
 
 jogo_iniciado = False
 
@@ -40,6 +42,8 @@ ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'bronze', 'prata', 'ouro', 'madeira',
 bloco_selecionado = 'grama'
 indice_selecionado = 0
 jogador = FirstPersonController(enabled=False)
+# Um pulo extra fica disponível a cada vez que o jogador toca o chão.
+pulos_extras = 1
 
 # --- CRIAÇÃO DA HOTBAR VISUAL ---
 hotbar_conteiner = Entity(parent=camera.ui, enabled=False)
@@ -108,6 +112,7 @@ def resetar_entidades_mundo():
         for sub_malha in chunks_entidades[(cx, cz)]:
             destroy(sub_malha)
     chunks_entidades.clear()
+    chunks_pendentes.clear()
 
 
 def mostrar_carregamento_novo():
@@ -281,52 +286,159 @@ def gerar_dados_relevo(cx, cz):
     chunks_gerados.add((cx, cz))
 
 
-# --- 5. SISTEMA DE RE-MESCLAGEM INDEPENDENTE COMPACTO E RÁPIDO ---
+# --- 5. MALHAS DE FACES VISÍVEIS ---
+# Blocos ocultos pelos seis vizinhos não viram geometria. Também evitamos criar
+# milhares de Entity temporárias e chamar combine() para cada material.
+FACES_CUBO = (
+    ((1, 0, 0), ((.5, 0, -.5), (.5, 0, .5), (.5, 1, .5), (.5, 1, -.5))),
+    ((-1, 0, 0), ((-.5, 0, -.5), (-.5, 0, .5), (-.5, 1, .5), (-.5, 1, -.5))),
+    ((0, 1, 0), ((-.5, 1, -.5), (-.5, 1, .5), (.5, 1, .5), (.5, 1, -.5))),
+    ((0, -1, 0), ((-.5, 0, .5), (-.5, 0, -.5), (.5, 0, -.5), (.5, 0, .5))),
+    ((0, 0, 1), ((.5, 0, .5), (.5, 1, .5), (-.5, 1, .5), (-.5, 0, .5))),
+    ((0, 0, -1), ((-.5, 0, -.5), (-.5, 1, -.5), (.5, 1, -.5), (.5, 0, -.5))),
+)
+UV_FACE = ((0, 0), (1, 0), (1, 1), (0, 1))
+
+
+def remover_chunk(cx, cz):
+    for sub_malha in chunks_entidades.pop((cx, cz), []):
+        sub_malha.collider = None
+        destroy(sub_malha)
+    chunks_pendentes.discard((cx, cz))
+
+
+def solicitar_atualizacao_chunk(cx, cz):
+    """Agrupa pedidos repetidos de reconstrução no mesmo chunk."""
+    chunks_pendentes.add((cx, cz))
+
+
 def atualizar_malha_chunk(cx, cz):
-    global chunks_entidades
-    if (cx, cz) in chunks_entidades:
-        for sub_malha in chunks_entidades[(cx, cz)]:
-            sub_malha.collider = None
-            destroy(sub_malha)
-        del chunks_entidades[(cx, cz)]
-
+    remover_chunk(cx, cz)
     gerar_dados_relevo(cx, cz)
-    sub_malhas_do_chunk = []
 
+    # Dados dos vizinhos evitam faces desenhadas em dobro nas bordas.
+    for dx in (-1, 0, 1):
+        for dz in (-1, 0, 1):
+            gerar_dados_relevo(cx + dx, cz + dz)
+
+    dados_malha = {tipo: {'vertices': [], 'triangles': [], 'uvs': []}
+                   for tipo in TEXTURAS_BLOCOS}
     x_min = cx * TAMANHO_CHUNK
-    x_max = x_min + TAMANHO_CHUNK
     z_min = cz * TAMANHO_CHUNK
-    z_max = z_min + TAMANHO_CHUNK
 
-    # OTIMIZAÇÃO SUPREMA: Filtramos diretamente o dicionário usando compreensão de lista.
-    # Em vez de testar milhares de blocos de ar com loops, o Python separa em nanosegundos
-    # apenas os blocos reais que pertencem às coordenadas deste chunk.
-    blocos_deste_chunk = [
-        (pos, tipo) for pos, tipo in cache_mapa.items()
-        if x_min <= pos[0] < x_max and z_min <= pos[2] < z_max and -ALTURA_MAXIMA <= pos[
-            1] < ALTURA_MAXIMA and tipo is not None
-    ]
+    # Apenas 3.840 consultas no dicionário por chunk, em vez de varrer o mapa
+    # inteiro uma vez para cada chunk e para cada material.
+    for x in range(x_min, x_min + TAMANHO_CHUNK):
+        for z in range(z_min, z_min + TAMANHO_CHUNK):
+            for y in range(-ALTURA_MAXIMA, ALTURA_MAXIMA):
+                tipo = cache_mapa.get((x, y, z))
+                if tipo is None:
+                    continue
+                dados = dados_malha[tipo]
+                for (dx, dy, dz), vertices_face in FACES_CUBO:
+                    if cache_mapa.get((x + dx, y + dy, z + dz)) is not None:
+                        continue
+                    inicio = len(dados['vertices'])
+                    dados['vertices'].extend(
+                        (x + vx, y + vy, z + vz) for vx, vy, vz in vertices_face
+                    )
+                    dados['triangles'].extend((inicio, inicio + 1, inicio + 2,
+                                               inicio, inicio + 2, inicio + 3))
+                    dados['uvs'].extend(UV_FACE)
 
-    # Agrupa os blocos por tipo para rodar o combine apenas nas texturas corretas
-    for tipo_alvo, arquivo_textura in TEXTURAS_BLOCOS.items():
-        conteiner_tipo = Entity(parent=scene)
-        blocos_desse_tipo = 0
-
-        for pos, tipo in blocos_deste_chunk:
-            if tipo == tipo_alvo:
-                Entity(parent=conteiner_tipo, model='cube', position=pos, origin_y=0.5, color=color.white)
-                blocos_desse_tipo += 1
-
-        if blocos_desse_tipo > 0:
-            conteiner_tipo.combine(auto_destroy=True)
-            conteiner_tipo.texture = arquivo_textura
-            conteiner_tipo.collider = 'mesh'
-            sub_malhas_do_chunk.append(conteiner_tipo)
-        else:
-            destroy(conteiner_tipo)
-
+    sub_malhas_do_chunk = []
+    for tipo, dados in dados_malha.items():
+        if not dados['vertices']:
+            continue
+        malha = Mesh(vertices=dados['vertices'], triangles=dados['triangles'],
+                     uvs=dados['uvs'], mode='triangle', static=True)
+        # As faces são geradas manualmente. Desenhar ambos os lados impede que
+        # uma face seja invisível caso a câmera a observe pelo verso.
+        entidade = Entity(parent=scene, model=malha, texture=TEXTURAS_BLOCOS[tipo],
+                          collider='mesh', double_sided=True)
+        sub_malhas_do_chunk.append(entidade)
     if sub_malhas_do_chunk:
         chunks_entidades[(cx, cz)] = sub_malhas_do_chunk
+
+
+def processar_fila_chunks(limite=1):
+    if not chunks_pendentes:
+        return
+    jogador_chunk = (int(jogador.x // TAMANHO_CHUNK), int(jogador.z // TAMANHO_CHUNK))
+    proximos = sorted(chunks_pendentes,
+                      key=lambda c: (c[0] - jogador_chunk[0]) ** 2 + (c[1] - jogador_chunk[1]) ** 2)
+    for chunk in proximos[:limite]:
+        chunks_pendentes.discard(chunk)
+        atualizar_malha_chunk(*chunk)
+
+
+def solicitar_atualizacoes_do_bloco(x, z):
+    """Reconstrói também o vizinho quando a alteração toca a borda do chunk."""
+    cx, cz = x // TAMANHO_CHUNK, z // TAMANHO_CHUNK
+    solicitar_atualizacao_chunk(cx, cz)
+    if x % TAMANHO_CHUNK == 0:
+        solicitar_atualizacao_chunk(cx - 1, cz)
+    elif x % TAMANHO_CHUNK == TAMANHO_CHUNK - 1:
+        solicitar_atualizacao_chunk(cx + 1, cz)
+    if z % TAMANHO_CHUNK == 0:
+        solicitar_atualizacao_chunk(cx, cz - 1)
+    elif z % TAMANHO_CHUNK == TAMANHO_CHUNK - 1:
+        solicitar_atualizacao_chunk(cx, cz + 1)
+
+
+def coordenada_do_ponto(ponto):
+    """Converte uma posição do mundo para a grade dos blocos."""
+    return (
+        math.floor(ponto.x + 0.5),
+        math.floor(ponto.y),
+        math.floor(ponto.z + 0.5),
+    )
+
+
+def bloco_mirado(distancia_maxima=6):
+    """Raycast exato na grade de voxels, independente do collider da malha."""
+    origem = camera.world_position
+    direcao = camera.forward.normalized()
+    celula = coordenada_do_ponto(origem)
+
+    passo_x = 1 if direcao.x >= 0 else -1
+    passo_y = 1 if direcao.y >= 0 else -1
+    passo_z = 1 if direcao.z >= 0 else -1
+
+    # Os blocos ocupam x/z de -0.5 a +0.5 e y de 0 a +1.
+    limite_x = celula[0] + (0.5 if passo_x > 0 else -0.5)
+    limite_y = celula[1] + (1 if passo_y > 0 else 0)
+    limite_z = celula[2] + (0.5 if passo_z > 0 else -0.5)
+
+    infinito = float('inf')
+    t_x = (limite_x - origem.x) / direcao.x if direcao.x else infinito
+    t_y = (limite_y - origem.y) / direcao.y if direcao.y else infinito
+    t_z = (limite_z - origem.z) / direcao.z if direcao.z else infinito
+    delta_x = abs(1 / direcao.x) if direcao.x else infinito
+    delta_y = abs(1 / direcao.y) if direcao.y else infinito
+    delta_z = abs(1 / direcao.z) if direcao.z else infinito
+
+    distancia = 0
+    for _ in range(128):
+        anterior = celula
+        if t_x <= t_y and t_x <= t_z:
+            distancia = t_x
+            t_x += delta_x
+            celula = (celula[0] + passo_x, celula[1], celula[2])
+        elif t_y <= t_z:
+            distancia = t_y
+            t_y += delta_y
+            celula = (celula[0], celula[1] + passo_y, celula[2])
+        else:
+            distancia = t_z
+            t_z += delta_z
+            celula = (celula[0], celula[1], celula[2] + passo_z)
+
+        if distancia > distancia_maxima:
+            break
+        if cache_mapa.get(celula) is not None:
+            return celula, anterior
+    return None, None
 
 
 # --- 6. CARREGAMENTO DINÂMICO DE CHUNKS SUAVE ---
@@ -341,18 +453,15 @@ def gerenciar_chunks_visiveis():
         for cz in range(chunk_player_z - DISTANCIA_VISAO, chunk_player_z + DISTANCIA_VISAO + 1):
             chunks_necessarios.add((cx, cz))
 
-    # Carrega os chunks novos sem travar a linha de processamento do frame
+    # O trabalho pesado é feito pela fila, no máximo um chunk por frame.
     for cx, cz in chunks_necessarios:
         if (cx, cz) not in chunks_entidades:
-            atualizar_malha_chunk(cx, cz)
+            solicitar_atualizacao_chunk(cx, cz)
 
     # Remove chunks distantes para manter o consumo de memória RAM sempre baixo
     chunks_para_remover = [c for c in chunks_entidades if c not in chunks_necessarios]
     for c in chunks_para_remover:
-        for sub_malha in chunks_entidades[c]:
-            sub_malha.collider = None
-            destroy(sub_malha)
-        del chunks_entidades[c]
+        remover_chunk(*c)
 
 
 # --- 7. RELAÇÃO DE INTERFACES E MENUS GRÁFICOS ---
@@ -491,7 +600,7 @@ def alternar_menu_pausa():
 # --- 8. GERENCIAMENTO GLOBAL DE ENTRADAS ---
 # --- 8. GERENCIAMENTO GLOBAL DE ENTRADAS ---
 def input(key):
-    global bloco_selecionado, indice_selecionado
+    global bloco_selecionado, indice_selecionado, pulos_extras
 
     # Se o menu de opções gráficas estiver aberto, ESC apenas fecha ele
     if menu_opcoes.enabled and key == 'escape':
@@ -510,6 +619,13 @@ def input(key):
 
     # Se a pausa estiver aberta na tela, bloqueia os comandos de quebrar/colocar blocos abaixo
     if menu_pausa.enabled:
+        return
+
+    # O FirstPersonController cuida do primeiro pulo no chão. No ar, este
+    # segundo pulo usa a mesma animação e só pode acontecer uma vez.
+    if key == 'space' and not jogador.grounded and pulos_extras > 0:
+        jogador.animate_y(jogador.y + jogador.jump_height, duration=.35, curve=curve.out_expo)
+        pulos_extras -= 1
         return
 
     # --- SELEÇÃO DA HOTBAR ---
@@ -532,46 +648,20 @@ def input(key):
         mao_jogador.animate_rotation(Vec3(15, -20, 5), duration=0.1, curve=curve.linear)
 
     # --- LOGICA DE QUEBRAR E COLOCAR BLOCOS ---
-    if mouse.hovered_entity and key in ['left mouse down', 'right mouse down']:
-        ponto_colisao = mouse.world_point
-        normal_face = mouse.normal
+    if key in ['left mouse down', 'right mouse down']:
+        coordenada_bloco, celula_livre = bloco_mirado()
+        if coordenada_bloco is None:
+            return
 
         if key == 'left mouse down':
-            pos_alvo = ponto_colisao - normal_face * 0.5
-            alvo_x = math.floor(pos_alvo.x + 0.5)
-            alvo_y = math.floor(pos_alvo.y + 0.5)
-            alvo_z = math.floor(pos_alvo.z + 0.5)
+            del cache_mapa[coordenada_bloco]
+            alvo_x, _, alvo_z = coordenada_bloco
+            solicitar_atualizacoes_do_bloco(alvo_x, alvo_z)
 
-            coordenada_bloco = (alvo_x, alvo_y, alvo_z)
-            if cache_mapa.get(coordenada_bloco) is not None:
-                del cache_mapa[coordenada_bloco]
-                cx = alvo_x // TAMANHO_CHUNK
-                cz = alvo_z // TAMANHO_CHUNK
-                atualizar_malha_chunk(cx, cz)
-
-        elif key == 'right mouse down':
-            pos_alvo = ponto_colisao + normal_face * 0.5
-            alvo_x = math.floor(pos_alvo.x + 0.5)
-            alvo_y = math.floor(pos_alvo.y + 0.5)
-            alvo_z = math.floor(pos_alvo.z + 0.5)
-
-            coordenada_bloco = (alvo_x, alvo_y, alvo_z)
-            cache_mapa[coordenada_bloco] = bloco_selecionado
-            cx = alvo_x // TAMANHO_CHUNK
-            cz = alvo_z // TAMANHO_CHUNK
-            atualizar_malha_chunk(cx, cz)
-
-        elif key == 'right mouse down':
-            pos_alvo = ponto_colisao + normal_face * 0.5
-            alvo_x = math.floor(pos_alvo.x + 0.5)
-            alvo_y = math.floor(pos_alvo.y + 0.5)
-            alvo_z = math.floor(pos_alvo.z + 0.5)
-
-            coordenada_bloco = (alvo_x, alvo_y, alvo_z)
-            cache_mapa[coordenada_bloco] = bloco_selecionado
-            cx = alvo_x // TAMANHO_CHUNK
-            cz = alvo_z // TAMANHO_CHUNK
-            atualizar_malha_chunk(cx, cz)
+        elif celula_livre is not None and cache_mapa.get(celula_livre) is None:
+            cache_mapa[celula_livre] = bloco_selecionado
+            alvo_x, _, alvo_z = celula_livre
+            solicitar_atualizacoes_do_bloco(alvo_x, alvo_z)
 
 
 # --- 9. LAÇO DE ATUALIZAÇÃO POR FRAME ---
@@ -579,7 +669,7 @@ _temporizador = 0
 
 
 def update():
-    global _temporizador
+    global _temporizador, pulos_extras
 
     if not jogo_iniciado or tela_carregamento.enabled:
         return
@@ -603,7 +693,12 @@ def update():
         return
     else:
         jogador.speed = 5
-        jogador.jump_height = 1
+        jogador.jump_height = 2
+        if jogador.grounded:
+            pulos_extras = 1
+
+    # Mantém o carregamento suave mesmo ao entrar numa área ainda não criada.
+    processar_fila_chunks(limite=1)
 
     _temporizador += time.dt
     if _temporizador > 0.3:
