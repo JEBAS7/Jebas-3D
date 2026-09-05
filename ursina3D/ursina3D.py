@@ -247,7 +247,6 @@ def gerar_arvore_no_cache(base_x, base_y, base_z):
 
 
 # --- 4. GERAÇÃO MATEMÁTICA DO TERRENO ---
-# --- 4. GERAÇÃO MATEMÁTICA DO TERRENO CORRIGIDA ---
 def gerar_dados_relevo(cx, cz):
     # Se este chunk já teve seu relevo inicial gerado, não calcula de novo (evita recriar blocos cavados)
     if (cx, cz) in chunks_gerados:
@@ -598,7 +597,6 @@ def alternar_menu_pausa():
 
 
 # --- 8. GERENCIAMENTO GLOBAL DE ENTRADAS ---
-# --- 8. GERENCIAMENTO GLOBAL DE ENTRADAS ---
 def input(key):
     global bloco_selecionado, indice_selecionado, pulos_extras
 
@@ -611,7 +609,6 @@ def input(key):
     if not jogo_iniciado:
         return
 
-    # CORREÇÃO LOGICA DO ESC:
     # Se apertar ESC, ele simplesmente alterna o estado da pausa (abre ou fecha e volta pro jogo)
     if key == 'escape':
         alternar_menu_pausa()
