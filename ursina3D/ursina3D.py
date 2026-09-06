@@ -1,6 +1,5 @@
 from ursina import *
 from ursina.prefabs.first_person_controller import FirstPersonController
-from ursina.shaders import unlit_shader
 from panda3d.core import TransparencyAttrib
 import math
 import os
@@ -64,10 +63,11 @@ TEXTURAS_BLOCOS = {
 plano_agua = Entity(
     parent=scene,
     model='plane',
-    scale=(1000, 1, 1000),
+    scale=(500, 1, 500),
     position=(0, NIVEL_AGUA + 4, 0),
     texture='agua',
     color=color.azure,
+    texture_scale=(25, 25),
     alpha=0.4,
     unlit=True,
     double_sided=True,
@@ -812,7 +812,7 @@ def update():
 
     if 'plano_agua' in globals() and plano_agua:
         # 1. CORRENTEZA BEM SUAVE: Reduzimos os valores para a textura deslizar devagarzinho
-        plano_agua.texture_offset += Vec2(0.002 * time.dt, 0.001 * time.dt)
+        plano_agua.texture_offset += Vec2(0.05 * time.dt, 0.01 * time.dt)
 
         # 2. MARÉ LENTA: Ajustamos o math.sin para subir e descer de forma quase imperceptível
         plano_agua.y = (NIVEL_AGUA + 4) + math.sin(time.time() * 0.8) * 0.03
@@ -903,7 +903,7 @@ def update():
 
         movimento_horizontal = Vec3(0, 0, 0)
         if held_keys['w']: movimento_horizontal += direcao_frente
-        if held_keys['s']: movimiento_horizontal -= direcao_frente
+        if held_keys['s']: movimento_horizontal -= direcao_frente
         if held_keys['d']: movimento_horizontal += direcao_lado
         if held_keys['a']: movimento_horizontal -= direcao_lado
 
