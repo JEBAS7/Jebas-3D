@@ -1,5 +1,7 @@
 from ursina import *
 from ursina.prefabs.first_person_controller import FirstPersonController
+from ursina.shaders import unlit_shader
+from panda3d.core import TransparencyAttrib
 import math
 import os
 import json
@@ -17,19 +19,41 @@ except Exception:
 # --- 1. CONFIGURAÇÕES DO MUNDO ---
 TAMANHO_CHUNK = 8
 ALTURA_MAXIMA = 30
-DISTANCIA_VISAO = 3
+DISTANCIA_VISAO = 2
+SEED_MUNDO = 93817
+NIVEL_AGUA = 0
+NIVEL_OCEANO = 0
+LIMITE_OCEANO = 0.43
+
+# --- BIOMAS E ÁGUA ---
+TAMANHO_BIOMA = 120
+BIOMAS = {
+    'planicie': {'topo': 'grama', 'subsolo': 'terra', 'arvores': 0.16, 'altura': 0},
+    'floresta': {'topo': 'grama', 'subsolo': 'terra', 'arvores': 0.48, 'altura': 1},
+    'deserto': {'topo': 'areia', 'subsolo': 'areia', 'arvores': 0.02, 'altura': -1},
+    'montanha': {'topo': 'pedra', 'subsolo': 'pedra', 'arvores': 0.01, 'altura': 8},
+}
+cache_biomas = {}
+
+VELOCIDADE_NADO = 3.6
+VELOCIDADE_VERTICAL_NADO = 3.2
+
 cache_mapa = {}
 chunks_entidades = {}
 chunks_gerados = set()
-# Chunks são construídos em pequenos lotes para não travar ao caminhar.
 chunks_pendentes = set()
+chunks_com_agua = set()
 
 jogo_iniciado = False
+
+COR_AGUA = color.rgba(60, 170, 255, 85)  # Azul Perfeito
 
 TEXTURAS_BLOCOS = {
     'grama': 'texturas/grama.png' if os.path.exists('texturas/grama.png') else 'white_cube',
     'terra': 'texturas/terra.png' if os.path.exists('texturas/terra.png') else 'white_cube',
     'pedra': 'texturas/pedra.png' if os.path.exists('texturas/pedra.png') else 'white_cube',
+    'areia': 'texturas/areia.png' if os.path.exists('texturas/areia.png') else 'white_cube',
+    'agua': 'texturas/agua.png' if os.path.exists('texturas/agua.png') else 'white_cube',
     'bronze': 'texturas/bronze.png' if os.path.exists('texturas/bronze.png') else 'white_cube',
     'prata': 'texturas/prata.png' if os.path.exists('texturas/prata.png') else 'white_cube',
     'ouro': 'texturas/ouro.png' if os.path.exists('texturas/ouro.png') else 'white_cube',
@@ -37,13 +61,37 @@ TEXTURAS_BLOCOS = {
     'folhas': 'texturas/folhas.png' if os.path.exists('texturas/folhas.png') else 'white_cube'
 }
 
+# A água será desenhada como um plano único e global (100% eficiente)
+plano_agua = Entity(
+    parent=scene,
+    model='plane',
+    scale=(1000, 1, 1000),
+    position=(0, NIVEL_AGUA + 4, 0),
+    texture=TEXTURAS_BLOCOS['agua'],
+    # texture_scale=(15, 15),   # repete a textura várias vezes pro plano gigante não ficar esticado
+    double_sided=False,
+    collider=None
+)
+plano_agua.setTransparency(TransparencyAttrib.MAlpha)
+plano_agua.alpha = 0.6  # deixa um pouco translúcida por cima da textura
+plano_agua.texture.filtering = True
+
 ARQUIVO_SAVE = 'mundo_save.json'
-ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
+ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'agua', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
 bloco_selecionado = 'grama'
 indice_selecionado = 0
+
+# Física manual
 jogador = FirstPersonController(enabled=False)
-# Um pulo extra fica disponível a cada vez que o jogador toca o chão.
-pulos_extras = 1
+jogador.gravity = 0
+jogador.speed = 0
+jogador.jump_height = 0
+
+pulos_extras = 2
+velocidade_vertical = 0.0
+
+efeito_agua = Entity(parent=camera.ui, model='quad', scale=2,
+                     color=color.rgba(20, 150, 255, 0.32), z=0.1, enabled=False)
 
 # --- CRIAÇÃO DA HOTBAR VISUAL ---
 hotbar_conteiner = Entity(parent=camera.ui, enabled=False)
@@ -86,7 +134,6 @@ hotbar_seletor = Entity(
     border_width=0.07
 )
 
-# --- CRIAÇÃO DO MODELO DO BRAÇO/MÃO 3D ---
 mao_jogador = Entity(
     parent=camera,
     model='cube',
@@ -113,6 +160,23 @@ def resetar_entidades_mundo():
             destroy(sub_malha)
     chunks_entidades.clear()
     chunks_pendentes.clear()
+    chunks_com_agua.clear()
+
+
+def altura_do_chao(x, z):
+    """Encontra o topo sólido da coluna para nascer/recuperar o jogador (ignora água)."""
+    for y in range(ALTURA_MAXIMA - 1, -ALTURA_MAXIMA - 1, -1):
+        tipo = cache_mapa.get((int(x), int(y), int(z)))
+        if tipo is not None and tipo != 'agua' and tipo != 'folhas' and tipo != 'madeira':
+            return y
+    return 0
+
+
+def posicionar_jogador_na_superficie(x, z):
+    cx, cz = x // TAMANHO_CHUNK, z // TAMANHO_CHUNK
+    atualizar_malha_chunk(cx, cz)
+    y_chao = altura_do_chao(x, z)
+    jogador.position = (x, y_chao + 3, z)
 
 
 def mostrar_carregamento_novo():
@@ -122,18 +186,24 @@ def mostrar_carregamento_novo():
 
 
 def iniciar_novo_mundo():
-    global jogo_iniciado
+    global jogo_iniciado, velocidade_vertical
     jogo_iniciado = True
+    velocidade_vertical = 0
     cache_mapa.clear()
+    cache_biomas.clear()
+    chunks_gerados.clear()
+    chunks_com_agua.clear()
     resetar_entidades_mundo()
     jogador.enabled = True
-    jogador.x, jogador.y, jogador.z = 4, 25, 4
+    jogador.gravity = 0
+    posicionar_jogador_na_superficie(4, 4)
     mouse.locked = True
     mouse.visible = False
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
     mao_jogador.enabled = True
+    plano_agua.enabled = True
 
 
 def mostrar_carregamento_salvo():
@@ -145,10 +215,11 @@ def mostrar_carregamento_salvo():
 
 
 def iniciar_mundo_carregado():
-    global cache_mapa, jogo_iniciado
+    global cache_mapa, jogo_iniciado, velocidade_vertical
     jogo_iniciado = True
+    velocidade_vertical = 0
     jogador.enabled = True
-    jogador.x, jogador.y, jogador.z = 4, 25, 4
+    jogador.gravity = 0
     mouse.locked = True
     mouse.visible = False
 
@@ -156,6 +227,8 @@ def iniciar_mundo_carregado():
         dados_carregados = json.load(f)
 
     cache_mapa.clear()
+    chunks_gerados.clear()
+    chunks_com_agua.clear()
     resetar_entidades_mundo()
     for chave_string, tipo in dados_carregados.items():
         coordenadas = chave_string.split(',')
@@ -163,10 +236,12 @@ def iniciar_mundo_carregado():
             x, y, z = int(coordenadas[0]), int(coordenadas[1]), int(coordenadas[2])
             cache_mapa[(x, y, z)] = tipo
 
+    posicionar_jogador_na_superficie(4, 4)
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
     mao_jogador.enabled = True
+    plano_agua.enabled = True
 
 
 def salvar_mundo():
@@ -195,6 +270,7 @@ def carregar_mundo_pausa():
     with open(ARQUIVO_SAVE, 'r') as f:
         dados_carregados = json.load(f)
     cache_mapa.clear()
+    chunks_gerados.clear()
     for chave_string, tipo in dados_carregados.items():
         coordenadas = chave_string.split(',')
         if len(coordenadas) == 3:
@@ -202,6 +278,7 @@ def carregar_mundo_pausa():
             cache_mapa[(x, y, z)] = tipo
 
     resetar_entidades_mundo()
+    posicionar_jogador_na_superficie(4, 4)
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
@@ -212,19 +289,23 @@ def carregar_mundo_pausa():
 
 
 def voltar_ao_menu_inicial():
-    global jogo_iniciado
+    global jogo_iniciado, velocidade_vertical
     jogo_iniciado = False
+    velocidade_vertical = 0
     menu_pausa.enabled = False
     hotbar_conteiner.enabled = False
     mao_jogador.enabled = False
     jogador.enabled = False
+    jogador.gravity = 0
 
     resetar_entidades_mundo()
     cache_mapa.clear()
+    cache_biomas.clear()
 
     menu_inicial.enabled = True
     mouse.locked = False
     mouse.visible = True
+    plano_agua.enabled = False
 
 
 # --- 3. GERADOR PROCEDURAL DE ÁRVORES ---
@@ -247,47 +328,125 @@ def gerar_arvore_no_cache(base_x, base_y, base_z):
 
 
 # --- 4. GERAÇÃO MATEMÁTICA DO TERRENO ---
+def valor_aleatorio(x, z, seed=0):
+    valor = math.sin(x * 127.1 + z * 311.7 + (SEED_MUNDO + seed) * 74.7) * 43758.5453
+    return valor - math.floor(valor)
+
+
+def ruido(x, z, escala, seed=0):
+    x /= escala
+    z /= escala
+    x0, z0 = math.floor(x), math.floor(z)
+    x1, z1 = x0 + 1, z0 + 1
+    tx, tz = x - x0, z - z0
+    tx = tx * tx * (3 - 2 * tx)
+    tz = tz * tz * (3 - 2 * tz)
+    baixo = lerp(valor_aleatorio(x0, z0, seed), valor_aleatorio(x1, z0, seed), tx)
+    alto = lerp(valor_aleatorio(x0, z1, seed), valor_aleatorio(x1, z1, seed), tx)
+    return lerp(baixo, alto, tz)
+
+
+def ruido_suave(x, z, escala, seed=0):
+    return (
+            ruido(x, z, escala, seed) * 0.50
+            + ruido(x + 31, z + 17, escala * 2, seed + 1) * 0.30
+            + ruido(x - 47, z + 12, escala * 4, seed + 2) * 0.20
+    )
+
+
+def obter_bioma(x, z):
+    chave = (x // TAMANHO_BIOMA, z // TAMANHO_BIOMA)
+    if chave in cache_biomas:
+        return cache_biomas[chave]
+    bx, bz = chave
+    temperatura = ruido_suave(bx * 17, bz * 17, 5, 70)
+    umidade = ruido_suave(bx * 23 + 100, bz * 23 - 50, 5, 80)
+    altitude = ruido_suave(bx * 11 - 30, bz * 11 + 20, 5, 90)
+
+    if altitude > 0.68:
+        bioma = 'montanha'
+    elif temperatura > 0.62 and umidade < 0.48:
+        bioma = 'deserto'
+    elif umidade > 0.58:
+        bioma = 'floresta'
+    else:
+        bioma = 'planicie'
+    cache_biomas[chave] = bioma
+    return bioma
+
+
 def gerar_dados_relevo(cx, cz):
-    # Se este chunk já teve seu relevo inicial gerado, não calcula de novo (evita recriar blocos cavados)
     if (cx, cz) in chunks_gerados:
         return
 
-    random.seed(f"{cx}_{cz}_jebas3d")
     possiveis_locais_arvores = []
+    fundo_do_mundo = -12
 
     for x in range(cx * TAMANHO_CHUNK, (cx + 1) * TAMANHO_CHUNK):
         for z in range(cz * TAMANHO_CHUNK, (cz + 1) * TAMANHO_CHUNK):
-            altura_calculada = int((math.sin(x / 4) + math.cos(z / 4)) * 2.5)
-            fundo_do_mundo = -12
+            bioma = obter_bioma(x, z)
+            cfg = BIOMAS[bioma]
+
+            relevo_grande = ruido_suave(x, z, 42, 10) * 18
+            relevo_detalhe = ruido_suave(x, z, 11, 20) * 5
+            altura_calculada = int(relevo_grande + relevo_detalhe - 8 + cfg['altura'])
+
+            mascara_oceano = ruido_suave(x, z, 90, 55)
+            mascara_lago = ruido_suave(x, z, 35, 30)
+            eh_oceano = mascara_oceano < LIMITE_OCEANO
+            eh_lago = mascara_lago > 0.69 and not eh_oceano
+            eh_agua = eh_oceano or eh_lago
+
+            if eh_oceano:
+                profundidade = int((LIMITE_OCEANO - mascara_oceano) * 28) + 3
+                altura_calculada = min(altura_calculada, NIVEL_OCEANO - profundidade)
+            elif eh_lago:
+                profundidade = int((mascara_lago - 0.69) * 22) + 2
+                altura_calculada = min(altura_calculada, NIVEL_AGUA - profundidade)
+
+            altura_fundo_agua = altura_calculada
+            if eh_agua:
+                altura_fundo_agua = NIVEL_AGUA - 3
 
             for y in range(fundo_do_mundo, altura_calculada + 1):
                 pos = (x, y, z)
-                if pos not in cache_mapa:
-                    if y == altura_calculada:
-                        cache_mapa[pos] = 'grama'
-                        possiveis_locais_arvores.append((x, y, z))
-                    elif y >= altura_calculada - 2:
-                        cache_mapa[pos] = 'terra'
-                    elif y == altura_calculada - 3:
+                if pos in cache_mapa:
+                    continue
+                if y == altura_calculada:
+                    if eh_agua or altura_calculada <= NIVEL_AGUA + 1:
+                        cache_mapa[pos] = 'areia'
+                    elif bioma == 'montanha' and altura_calculada > 13:
                         cache_mapa[pos] = 'pedra'
-                    elif y == altura_calculada - 4:
-                        cache_mapa[pos] = 'bronze'
-                    elif y == altura_calculada - 5:
-                        cache_mapa[pos] = 'prata'
                     else:
-                        cache_mapa[pos] = 'ouro'
+                        cache_mapa[pos] = cfg['topo']
+                        if cfg['arvores'] > 0:
+                            possiveis_locais_arvores.append((x, y, z))
+                elif eh_agua and y > altura_fundo_agua and y <= NIVEL_AGUA:
+                    cache_mapa[pos] = 'areia'
+                elif y >= altura_calculada - 3:
+                    cache_mapa[pos] = cfg['subsolo']
+                else:
+                    cache_mapa[pos] = 'pedra'
 
-    if possiveis_locais_arvores and random.random() < 0.3:
-        local = random.choice(possiveis_locais_arvores)
-        gerar_arvore_no_cache(*local)
+            if eh_agua:
+                chunks_com_agua.add((cx, cz))
+                # A água é apenas um marcador, o plano global cuida do visual.
+                for y in range(altura_calculada + 1, NIVEL_AGUA + 1):
+                    pos_agua = (x, y, z)
+                    if pos_agua not in cache_mapa:
+                        cache_mapa[pos_agua] = 'agua'
 
-    # Registra que este chunk já foi populado matematicamente
+    rng = random.Random(f"{cx}_{cz}_{SEED_MUNDO}")
+    bioma_centro = obter_bioma(cx * TAMANHO_CHUNK + TAMANHO_CHUNK // 2,
+                               cz * TAMANHO_CHUNK + TAMANHO_CHUNK // 2)
+    chance_arvore = BIOMAS[bioma_centro]['arvores']
+    if possiveis_locais_arvores and rng.random() < chance_arvore:
+        gerar_arvore_no_cache(*rng.choice(possiveis_locais_arvores))
+
     chunks_gerados.add((cx, cz))
 
 
-# --- 5. MALHAS DE FACES VISÍVEIS ---
-# Blocos ocultos pelos seis vizinhos não viram geometria. Também evitamos criar
-# milhares de Entity temporárias e chamar combine() para cada material.
+# --- 5. MALHAS COMBINADAS (double_sided=False para nunca bugar) ---
 FACES_CUBO = (
     ((1, 0, 0), ((.5, 0, -.5), (.5, 0, .5), (.5, 1, .5), (.5, 1, -.5))),
     ((-1, 0, 0), ((-.5, 0, -.5), (-.5, 0, .5), (-.5, 1, .5), (-.5, 1, -.5))),
@@ -301,13 +460,11 @@ UV_FACE = ((0, 0), (1, 0), (1, 1), (0, 1))
 
 def remover_chunk(cx, cz):
     for sub_malha in chunks_entidades.pop((cx, cz), []):
-        sub_malha.collider = None
         destroy(sub_malha)
     chunks_pendentes.discard((cx, cz))
 
 
 def solicitar_atualizacao_chunk(cx, cz):
-    """Agrupa pedidos repetidos de reconstrução no mesmo chunk."""
     chunks_pendentes.add((cx, cz))
 
 
@@ -315,31 +472,33 @@ def atualizar_malha_chunk(cx, cz):
     remover_chunk(cx, cz)
     gerar_dados_relevo(cx, cz)
 
-    # Dados dos vizinhos evitam faces desenhadas em dobro nas bordas.
     for dx in (-1, 0, 1):
         for dz in (-1, 0, 1):
             gerar_dados_relevo(cx + dx, cz + dz)
 
     dados_malha = {tipo: {'vertices': [], 'triangles': [], 'uvs': []}
                    for tipo in TEXTURAS_BLOCOS}
+
     x_min = cx * TAMANHO_CHUNK
     z_min = cz * TAMANHO_CHUNK
 
-    # Apenas 3.840 consultas no dicionário por chunk, em vez de varrer o mapa
-    # inteiro uma vez para cada chunk e para cada material.
     for x in range(x_min, x_min + TAMANHO_CHUNK):
         for z in range(z_min, z_min + TAMANHO_CHUNK):
             for y in range(-ALTURA_MAXIMA, ALTURA_MAXIMA):
                 tipo = cache_mapa.get((x, y, z))
-                if tipo is None:
+                if tipo is None or tipo == 'agua':
                     continue
+
                 dados = dados_malha[tipo]
                 for (dx, dy, dz), vertices_face in FACES_CUBO:
-                    if cache_mapa.get((x + dx, y + dy, z + dz)) is not None:
+                    vizinho = cache_mapa.get((x + dx, y + dy, z + dz))
+                    if vizinho is not None and vizinho != 'agua':
                         continue
+
                     inicio = len(dados['vertices'])
                     dados['vertices'].extend(
-                        (x + vx, y + vy, z + vz) for vx, vy, vz in vertices_face
+                        (x + vx, y + vy, z + vz)
+                        for vx, vy, vz in vertices_face
                     )
                     dados['triangles'].extend((inicio, inicio + 1, inicio + 2,
                                                inicio, inicio + 2, inicio + 3))
@@ -351,11 +510,12 @@ def atualizar_malha_chunk(cx, cz):
             continue
         malha = Mesh(vertices=dados['vertices'], triangles=dados['triangles'],
                      uvs=dados['uvs'], mode='triangle', static=True)
-        # As faces são geradas manualmente. Desenhar ambos os lados impede que
-        # uma face seja invisível caso a câmera a observe pelo verso.
-        entidade = Entity(parent=scene, model=malha, texture=TEXTURAS_BLOCOS[tipo],
-                          collider='mesh', double_sided=True)
-        sub_malhas_do_chunk.append(entidade)
+
+        # CORREÇÃO DO BUG BRANCO: double_sided=False e camera frustum culling
+        opcoes = {'parent': scene, 'model': malha, 'texture': TEXTURAS_BLOCOS[tipo],
+                  'double_sided': True, 'collider': None}
+        sub_malhas_do_chunk.append(Entity(**opcoes))
+
     if sub_malhas_do_chunk:
         chunks_entidades[(cx, cz)] = sub_malhas_do_chunk
 
@@ -372,7 +532,6 @@ def processar_fila_chunks(limite=1):
 
 
 def solicitar_atualizacoes_do_bloco(x, z):
-    """Reconstrói também o vizinho quando a alteração toca a borda do chunk."""
     cx, cz = x // TAMANHO_CHUNK, z // TAMANHO_CHUNK
     solicitar_atualizacao_chunk(cx, cz)
     if x % TAMANHO_CHUNK == 0:
@@ -386,7 +545,6 @@ def solicitar_atualizacoes_do_bloco(x, z):
 
 
 def coordenada_do_ponto(ponto):
-    """Converte uma posição do mundo para a grade dos blocos."""
     return (
         math.floor(ponto.x + 0.5),
         math.floor(ponto.y),
@@ -394,8 +552,11 @@ def coordenada_do_ponto(ponto):
     )
 
 
+def jogador_esta_na_agua():
+    return jogador.y < NIVEL_AGUA + 1.0
+
+
 def bloco_mirado(distancia_maxima=6):
-    """Raycast exato na grade de voxels, independente do collider da malha."""
     origem = camera.world_position
     direcao = camera.forward.normalized()
     celula = coordenada_do_ponto(origem)
@@ -404,7 +565,6 @@ def bloco_mirado(distancia_maxima=6):
     passo_y = 1 if direcao.y >= 0 else -1
     passo_z = 1 if direcao.z >= 0 else -1
 
-    # Os blocos ocupam x/z de -0.5 a +0.5 e y de 0 a +1.
     limite_x = celula[0] + (0.5 if passo_x > 0 else -0.5)
     limite_y = celula[1] + (1 if passo_y > 0 else 0)
     limite_z = celula[2] + (0.5 if passo_z > 0 else -0.5)
@@ -452,12 +612,10 @@ def gerenciar_chunks_visiveis():
         for cz in range(chunk_player_z - DISTANCIA_VISAO, chunk_player_z + DISTANCIA_VISAO + 1):
             chunks_necessarios.add((cx, cz))
 
-    # O trabalho pesado é feito pela fila, no máximo um chunk por frame.
     for cx, cz in chunks_necessarios:
         if (cx, cz) not in chunks_entidades:
             solicitar_atualizacao_chunk(cx, cz)
 
-    # Remove chunks distantes para manter o consumo de memória RAM sempre baixo
     chunks_para_remover = [c for c in chunks_entidades if c not in chunks_necessarios]
     for c in chunks_para_remover:
         remover_chunk(*c)
@@ -473,13 +631,11 @@ menu_inicial = Entity(parent=camera.ui, enabled=True)
 fundo_inicial = Entity(parent=menu_inicial, model='quad', scale=(2, 2), color=color.dark_gray, z=2)
 titulo_jogo = Text(parent=menu_inicial, text='JEBAS-3D', scale=3, position=(-0.15, 0.3), color=color.gold)
 
-# --- MENUS DE CONFIGURAÇÃO DE GRÁFICOS AVANÇADO ---
 menu_opcoes = Entity(parent=camera.ui, enabled=False)
 fundo_opcoes = Entity(parent=menu_opcoes, model='quad', scale=(2, 2), color=color.dark_gray, z=1)
 titulo_opcoes = Text(parent=menu_opcoes, text='OPÇÕES DE VÍDEO', scale=2.5, position=(-0.25, 0.4), color=color.white)
 
 
-# Funções de alteração gráfica
 def mudar_distancia_visao(valor):
     global DISTANCIA_VISAO
     DISTANCIA_VISAO = valor
@@ -503,20 +659,17 @@ def configurar_modo_tela(modo):
 
 def configurar_resolucao(largura, altura):
     window.size = (largura, altura)
-    # A Ursina já força o redimensionamento centralizado nativamente
 
 
-# Seção 1: Distância de Visão
 texto_distancia = Text(parent=menu_opcoes, text=f'Distancia de Visao: {DISTANCIA_VISAO} Chunks', position=(-0.4, 0.25),
                        scale=1.5)
 btn_vis_curta = Button(parent=menu_opcoes, text='CURTA (2)', scale=(0.18, 0.05), position=(-0.3, 0.17),
                        on_click=lambda: mudar_distancia_visao(2))
 btn_vis_media = Button(parent=menu_opcoes, text='MÉDIA (3)', scale=(0.18, 0.05), position=(-0.1, 0.17),
                        on_click=lambda: mudar_distancia_visao(3))
-btn_vis_longa = Button(parent=menu_opcoes, text='LONGA (4)', scale=(0.18, 0.05), position=(0.1, 0.17),
-                       on_click=lambda: mudar_distancia_visao(4))
+btn_vis_longa = Button(parent=menu_opcoes, text='LONGA (6)', scale=(0.18, 0.05), position=(0.1, 0.17),
+                       on_click=lambda: mudar_distancia_visao(6))
 
-# Seção 2: Modo de Exibição da Janela
 texto_modo_tela = Text(parent=menu_opcoes, text='Modo de Janela:', position=(-0.4, 0.05), scale=1.5)
 btn_modo_janela = Button(parent=menu_opcoes, text='JANELA', scale=(0.18, 0.05), position=(-0.3, -0.03),
                          on_click=lambda: configurar_modo_tela('janela'))
@@ -525,7 +678,6 @@ btn_modo_sem_borda = Button(parent=menu_opcoes, text='SEM BORDAS', scale=(0.18, 
 btn_modo_fullscreen = Button(parent=menu_opcoes, text='TELA CHEIA', scale=(0.18, 0.05), position=(0.1, -0.03),
                              on_click=lambda: configurar_modo_tela('tela_cheia'))
 
-# Seção 3: Resolução da Tela
 texto_resolucao = Text(parent=menu_opcoes, text='Resolucao do Jogo:', position=(-0.4, -0.15), scale=1.5)
 btn_res_baixa = Button(parent=menu_opcoes, text='1280x720', scale=(0.18, 0.05), position=(-0.3, -0.23),
                        on_click=lambda: configurar_resolucao(1280, 720))
@@ -552,7 +704,6 @@ def fechar_opcoes():
 btn_voltar_opc = Button(parent=menu_opcoes, text='VOLTAR', color=color.gray, scale=(0.25, 0.06), position=(0, -0.35),
                         on_click=fechar_opcoes)
 
-# Botões do Menu Inicial
 btn_novo = Button(parent=menu_inicial, text='NOVO MUNDO', color=color.azure, scale=(0.4, 0.07), position=(0, 0.08),
                   on_click=mostrar_carregamento_novo)
 btn_carregar = Button(parent=menu_inicial, text='CARREGAR MUNDO', color=color.orange, scale=(0.4, 0.07),
@@ -562,7 +713,6 @@ btn_opcoes_ini = Button(parent=menu_inicial, text='OPÇÕES GRÁFICAS', color=co
 btn_sair_ini = Button(parent=menu_inicial, text='SAIR', color=color.red, scale=(0.4, 0.07), position=(0, -0.16),
                       on_click=application.quit)
 
-# Menu de Pausa Configurado
 menu_pausa = Entity(parent=camera.ui, enabled=False)
 fundo_pausa = Entity(parent=menu_pausa, model='quad', scale=(2, 2), color=color.Color(0, 0, 0, 0.7), z=1)
 
@@ -598,37 +748,31 @@ def alternar_menu_pausa():
 
 # --- 8. GERENCIAMENTO GLOBAL DE ENTRADAS ---
 def input(key):
-    global bloco_selecionado, indice_selecionado, pulos_extras
+    global bloco_selecionado, indice_selecionado, pulos_extras, velocidade_vertical
 
-    # Se o menu de opções gráficas estiver aberto, ESC apenas fecha ele
     if menu_opcoes.enabled and key == 'escape':
         fechar_opcoes()
         return
 
-    # Se o jogo ainda não começou (está na tela de título), ignora o resto dos comandos
     if not jogo_iniciado:
         return
 
-    # Se apertar ESC, ele simplesmente alterna o estado da pausa (abre ou fecha e volta pro jogo)
     if key == 'escape':
         alternar_menu_pausa()
         return
 
-    # Se a pausa estiver aberta na tela, bloqueia os comandos de quebrar/colocar blocos abaixo
     if menu_pausa.enabled:
         return
 
-    # O FirstPersonController cuida do primeiro pulo no chão. No ar, este
-    # segundo pulo usa a mesma animação e só pode acontecer uma vez.
-    if key == 'space' and not jogador.grounded and pulos_extras > 0:
-        jogador.animate_y(jogador.y + jogador.jump_height, duration=.35, curve=curve.out_expo)
-        pulos_extras -= 1
+    if key == 'space' and not jogador_esta_na_agua() and jogador.grounded:
+        velocidade_vertical = 8.0
+        jogador.grounded = False
         return
 
-    # --- SELEÇÃO DA HOTBAR ---
-    if key in ['1', '2', '3', '4', '5', '6', '7', '8']:
+    if key in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0']:
         novo_index = int(key) - 1
-        atualizar_selecao_hotbar(novo_index)
+        if novo_index < len(ORDEM_BLOCOS):
+            atualizar_selecao_hotbar(novo_index)
 
     if key == 'scroll up':
         novo_index = (indice_selecionado + 1) % len(ORDEM_BLOCOS)
@@ -637,14 +781,12 @@ def input(key):
         novo_index = (indice_selecionado - 1) % len(ORDEM_BLOCOS)
         atualizar_selecao_hotbar(novo_index)
 
-    # --- ANIMAÇÃO DE SOCO/MINERAÇÃO COM O CLIQUE ---
     if key in ['left mouse down', 'right mouse down']:
         mao_jogador.position = Vec3(0.5, -0.4, 0.9)
         mao_jogador.rotation = Vec3(25, -10, 15)
         mao_jogador.animate_position(Vec3(0.6, -0.5, 1.1), duration=0.1, curve=curve.linear)
         mao_jogador.animate_rotation(Vec3(15, -20, 5), duration=0.1, curve=curve.linear)
 
-    # --- LOGICA DE QUEBRAR E COLOCAR BLOCOS ---
     if key in ['left mouse down', 'right mouse down']:
         coordenada_bloco, celula_livre = bloco_mirado()
         if coordenada_bloco is None:
@@ -666,7 +808,7 @@ _temporizador = 0
 
 
 def update():
-    global _temporizador, pulos_extras
+    global _temporizador, pulos_extras, velocidade_vertical
 
     if not jogo_iniciado or tela_carregamento.enabled:
         return
@@ -685,16 +827,87 @@ def update():
         mao_jogador.position = lerp(mao_jogador.position, Vec3(0.6, -0.5, 1.1), time.dt * 5)
 
     if menu_pausa.enabled:
-        jogador.speed = 0
-        jogador.jump_height = 0
+        efeito_agua.enabled = False
         return
-    else:
-        jogador.speed = 5
-        jogador.jump_height = 2
-        if jogador.grounded:
-            pulos_extras = 1
 
-    # Mantém o carregamento suave mesmo ao entrar numa área ainda não criada.
+    esta_na_agua = jogador_esta_na_agua()
+    efeito_agua.enabled = esta_na_agua
+
+    if esta_na_agua:
+        # --- MODO NATAÇÃO ---
+        velocidade_vertical = 0
+
+        direcao_frente = camera.forward
+        direcao_frente.y = 0
+        direcao_frente = direcao_frente.normalized()
+        direcao_lado = camera.right
+        direcao_lado.y = 0
+        direcao_lado = direcao_lado.normalized()
+
+        movimento_horizontal = Vec3(0, 0, 0)
+        if held_keys['w']: movimento_horizontal += direcao_frente
+        if held_keys['s']: movimento_horizontal -= direcao_frente
+        if held_keys['d']: movimento_horizontal += direcao_lado
+        if held_keys['a']: movimento_horizontal -= direcao_lado
+
+        if movimento_horizontal.length() > 0:
+            movimento_horizontal = movimento_horizontal.normalized() * VELOCIDADE_NADO * time.dt
+            jogador.position += movimento_horizontal
+
+        alvo_vertical = 0.0
+        if held_keys['space']:
+            alvo_vertical = VELOCIDADE_VERTICAL_NADO
+        if held_keys['shift']:
+            alvo_vertical = -VELOCIDADE_VERTICAL_NADO
+
+        if not held_keys['space'] and not held_keys['shift'] and abs(camera.forward.y) > 0.12:
+            alvo_vertical = camera.forward.y * VELOCIDADE_VERTICAL_NADO
+
+        jogador.y += alvo_vertical * time.dt
+
+        if jogador.y > NIVEL_AGUA + 0.9 and not held_keys['space']:
+            jogador.y = NIVEL_AGUA + 0.9
+
+        y_chao_atual = altura_do_chao(jogador.x, jogador.z)
+        if jogador.y < y_chao_atual + 1.2:
+            jogador.y = y_chao_atual + 1.2
+
+    else:
+        # --- MODO TERRA ---
+        velocidade_vertical -= 25 * time.dt
+        jogador.y += velocidade_vertical * time.dt
+
+        y_chao_atual = altura_do_chao(jogador.x, jogador.z)
+        if jogador.y <= y_chao_atual + 1.0:
+            jogador.y = y_chao_atual + 1.0
+            velocidade_vertical = 0
+            jogador.grounded = True
+            pulos_extras = 1
+        else:
+            jogador.grounded = False
+
+        velocidade_andar = 5.0
+        direcao_frente = camera.forward
+        direcao_frente.y = 0
+        direcao_frente = direcao_frente.normalized()
+        direcao_lado = camera.right
+        direcao_lado.y = 0
+        direcao_lado = direcao_lado.normalized()
+
+        movimento_horizontal = Vec3(0, 0, 0)
+        if held_keys['w']: movimento_horizontal += direcao_frente
+        if held_keys['s']: movimento_horizontal -= direcao_frente
+        if held_keys['d']: movimento_horizontal += direcao_lado
+        if held_keys['a']: movimento_horizontal -= direcao_lado
+
+        if movimento_horizontal.length() > 0:
+            movimento_horizontal = movimento_horizontal.normalized() * velocidade_andar * time.dt
+
+            nova_pos = jogador.position + movimento_horizontal
+            bloco_na_frente = cache_mapa.get(coordenada_do_ponto(nova_pos))
+            if bloco_na_frente is None or bloco_na_frente == 'agua':
+                jogador.position = nova_pos
+
     processar_fila_chunks(limite=1)
 
     _temporizador += time.dt
@@ -702,8 +915,11 @@ def update():
         gerenciar_chunks_visiveis()
         _temporizador = 0
 
-    if jogador.y < -30:
-        jogador.x, jogador.y, jogador.z = 4, 25, 4
+    if jogador.y < -15:
+        velocidade_vertical = 0
+        px = math.floor(jogador.x)
+        pz = math.floor(jogador.z)
+        posicionar_jogador_na_superficie(px, pz)
 
 
 # --- 10. INICIALIZAÇÃO DO JOGO ---
