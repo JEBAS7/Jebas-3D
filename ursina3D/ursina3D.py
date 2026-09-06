@@ -61,20 +61,20 @@ TEXTURAS_BLOCOS = {
     'folhas': 'texturas/folhas.png' if os.path.exists('texturas/folhas.png') else 'white_cube'
 }
 
-# A água será desenhada como um plano único e global (100% eficiente)
 plano_agua = Entity(
     parent=scene,
     model='plane',
     scale=(1000, 1, 1000),
     position=(0, NIVEL_AGUA + 4, 0),
-    texture=TEXTURAS_BLOCOS['agua'],
-    # texture_scale=(15, 15),   # repete a textura várias vezes pro plano gigante não ficar esticado
-    double_sided=False,
+    texture='agua',
+    color=color.azure,
+    alpha=0.4,
+    unlit=True,
+    double_sided=True,
     collider=None
 )
+
 plano_agua.setTransparency(TransparencyAttrib.MAlpha)
-plano_agua.alpha = 0.6  # deixa um pouco translúcida por cima da textura
-plano_agua.texture.filtering = True
 
 ARQUIVO_SAVE = 'mundo_save.json'
 ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'agua', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
@@ -810,6 +810,13 @@ _temporizador = 0
 def update():
     global _temporizador, pulos_extras, velocidade_vertical
 
+    if 'plano_agua' in globals() and plano_agua:
+        # 1. CORRENTEZA BEM SUAVE: Reduzimos os valores para a textura deslizar devagarzinho
+        plano_agua.texture_offset += Vec2(0.002 * time.dt, 0.001 * time.dt)
+
+        # 2. MARÉ LENTA: Ajustamos o math.sin para subir e descer de forma quase imperceptível
+        plano_agua.y = (NIVEL_AGUA + 4) + math.sin(time.time() * 0.8) * 0.03
+
     if not jogo_iniciado or tela_carregamento.enabled:
         return
 
@@ -896,7 +903,7 @@ def update():
 
         movimento_horizontal = Vec3(0, 0, 0)
         if held_keys['w']: movimento_horizontal += direcao_frente
-        if held_keys['s']: movimento_horizontal -= direcao_frente
+        if held_keys['s']: movimiento_horizontal -= direcao_frente
         if held_keys['d']: movimento_horizontal += direcao_lado
         if held_keys['a']: movimento_horizontal -= direcao_lado
 
