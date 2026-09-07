@@ -89,7 +89,7 @@ jogador.gravity = 0
 jogador.speed = 0
 jogador.jump_height = 0
 
-pulos_extras = 2
+pulos_extras = 1
 velocidade_vertical = 0.0
 
 efeito_agua = Entity(parent=camera.ui, model='quad', scale=2,
@@ -572,7 +572,7 @@ def atualizar_malha_chunk(cx, cz):
 
         # CORREÇÃO DO BUG BRANCO: double_sided=False e camera frustum culling
         opcoes = {'parent': scene, 'model': malha, 'texture': TEXTURAS_BLOCOS[tipo],
-                  'double_sided': True, 'collider': None}
+                  'double_sided': True, 'collider': True}
         sub_malhas_do_chunk.append(Entity(**opcoes))
 
     if sub_malhas_do_chunk:
