@@ -57,6 +57,7 @@ TEXTURAS_BLOCOS = {
     'bronze': 'texturas/bronze.png' if os.path.exists('texturas/bronze.png') else 'white_cube',
     'prata': 'texturas/prata.png' if os.path.exists('texturas/prata.png') else 'white_cube',
     'ouro': 'texturas/ouro.png' if os.path.exists('texturas/ouro.png') else 'white_cube',
+    'diamante': 'texturas/diamante.png' if os.path.exists('texturas/diamante.png') else 'white_cube',
     'madeira': 'texturas/madeira.png' if os.path.exists('texturas/madeira.png') else 'white_cube',
     'folhas': 'texturas/folhas.png' if os.path.exists('texturas/folhas.png') else 'white_cube'
 }
@@ -78,7 +79,7 @@ plano_agua = Entity(
 plano_agua.setTransparency(TransparencyAttrib.MAlpha)
 
 ARQUIVO_SAVE = 'mundo_save.json'
-ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
+ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'bronze', 'prata', 'ouro', 'diamante', 'madeira', 'folhas']
 bloco_selecionado = 'grama'
 indice_selecionado = 0
 
@@ -164,9 +165,21 @@ def resetar_entidades_mundo():
     chunks_com_agua.clear()
 
 
-def altura_do_chao(x, z):
-    """Encontra o topo sólido da coluna para nascer/recuperar o jogador (ignora água)."""
-    for y in range(ALTURA_MAXIMA - 1, -ALTURA_MAXIMA - 1, -1):
+def altura_do_chao(x, z, y_referencia=None):
+    """Encontra o topo sólido da coluna (ignora água/folhas/madeira).
+
+    Se y_referencia for informado, a busca começa a partir dessa altura
+    (arredondada pra baixo) em vez do topo absoluto do mapa. Isso é essencial
+    para a colisão em tempo real: sem isso, dentro de uma caverna com teto,
+    a função encontraria o teto (bloco sólido mais alto da coluna) e não o
+    piso onde o jogador realmente está pisando.
+    """
+    if y_referencia is None:
+        inicio = ALTURA_MAXIMA - 1
+    else:
+        inicio = min(ALTURA_MAXIMA - 1, math.floor(y_referencia))
+
+    for y in range(inicio, -ALTURA_MAXIMA - 1, -1):
         tipo = cache_mapa.get((int(x), int(y), int(z)))
         if tipo is not None and tipo != 'agua' and tipo != 'folhas' and tipo != 'madeira':
             return y
@@ -462,6 +475,8 @@ def gerar_dados_relevo(cx, cz):
                     sorteio = random.random()
                     if sorteio < 0.03:
                         cache_mapa[pos] = 'ouro'
+                    elif sorteio < 0.05:
+                        cache_mapa[pos] = 'diamante'
                     elif sorteio < 0.10:
                         cache_mapa[pos] = 'prata'
                     elif sorteio < 0.25:
@@ -594,6 +609,25 @@ def coordenada_do_ponto(ponto):
         math.floor(ponto.y),
         math.floor(ponto.z + 0.5),
     )
+
+
+def coluna_livre_para_jogador(ponto):
+    """Verifica se o jogador cabe na coluna (pé + cabeça) daquele ponto.
+
+    Testar só 1 célula (como antes) deixava passar dois bugs clássicos de
+    colisão em grade: (1) andar na diagonal perto de uma parede permitia
+    "cortar a quina" e atravessar a parede sem nunca testar a célula que
+    realmente bloqueia; (2) só uma altura era checada, então uma parede que
+    só existisse na altura da cabeça (ou um degrau na altura dos pés) não
+    era detectada. Aqui checamos as duas células verticais que o corpo do
+    jogador ocupa.
+    """
+    base = coordenada_do_ponto(ponto)
+    for dy in (0, 1):
+        tipo = cache_mapa.get((base[0], base[1] + dy, base[2]))
+        if tipo is not None and tipo != 'agua':
+            return False
+    return True
 
 
 def jogador_esta_na_agua():
@@ -921,7 +955,7 @@ def update():
         if jogador.y > NIVEL_AGUA + 0.9 and not held_keys['space']:
             jogador.y = NIVEL_AGUA + 0.9
 
-        y_chao_atual = altura_do_chao(jogador.x, jogador.z)
+        y_chao_atual = altura_do_chao(jogador.x, jogador.z, jogador.y)
         if jogador.y < y_chao_atual + 1.2:
             jogador.y = y_chao_atual + 1.2
 
@@ -930,7 +964,7 @@ def update():
         velocidade_vertical -= 25 * time.dt
         jogador.y += velocidade_vertical * time.dt
 
-        y_chao_atual = altura_do_chao(jogador.x, jogador.z)
+        y_chao_atual = altura_do_chao(jogador.x, jogador.z, jogador.y)
         if jogador.y <= y_chao_atual + 1.0:
             jogador.y = y_chao_atual + 1.0
             velocidade_vertical = 0
@@ -956,10 +990,16 @@ def update():
         if movimento_horizontal.length() > 0:
             movimento_horizontal = movimento_horizontal.normalized() * velocidade_andar * time.dt
 
-            nova_pos = jogador.position + movimento_horizontal
-            bloco_na_frente = cache_mapa.get(coordenada_do_ponto(nova_pos))
-            if bloco_na_frente is None or bloco_na_frente == 'agua':
-                jogador.position = nova_pos
+            # Testamos X e Z separadamente (em vez do ponto de destino combinado)
+            # para o jogador poder "deslizar" ao longo da parede da caverna em
+            # vez de travar, e para não cortar a quina na diagonal.
+            pos_x = jogador.position + Vec3(movimento_horizontal.x, 0, 0)
+            if coluna_livre_para_jogador(pos_x):
+                jogador.x = pos_x.x
+
+            pos_z = jogador.position + Vec3(0, 0, movimento_horizontal.z)
+            if coluna_livre_para_jogador(pos_z):
+                jogador.z = pos_z.z
 
     processar_fila_chunks(limite=1)
 
