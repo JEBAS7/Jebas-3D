@@ -52,6 +52,7 @@ TEXTURAS_BLOCOS = {
     'terra': 'texturas/terra.png' if os.path.exists('texturas/terra.png') else 'white_cube',
     'pedra': 'texturas/pedra.png' if os.path.exists('texturas/pedra.png') else 'white_cube',
     'areia': 'texturas/areia.png' if os.path.exists('texturas/areia.png') else 'white_cube',
+    'bedrock': 'texturas/bedrock.png' if os.path.exists('texturas/bedrock.png') else 'white_cube',
     'agua': 'texturas/agua.png' if os.path.exists('texturas/agua.png') else 'white_cube',
     'bronze': 'texturas/bronze.png' if os.path.exists('texturas/bronze.png') else 'white_cube',
     'prata': 'texturas/prata.png' if os.path.exists('texturas/prata.png') else 'white_cube',
@@ -345,6 +346,30 @@ def ruido(x, z, escala, seed=0):
     alto = lerp(valor_aleatorio(x0, z1, seed), valor_aleatorio(x1, z1, seed), tx)
     return lerp(baixo, alto, tz)
 
+def valor_aleatorio_3d(x, y, z, seed=0):
+    valor = math.sin(x * 127.1 + y * 311.7 + z * 74.7 + (SEED_MUNDO + seed) * 57.3) * 43758.5453
+    return valor - math.floor(valor)
+
+
+def ruido_3d(x, y, z, escala, seed=0):
+    x /= escala; y /= escala; z /= escala
+    x0, y0, z0 = math.floor(x), math.floor(y), math.floor(z)
+    x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
+    tx, ty, tz = x - x0, y - y0, z - z0
+    tx = tx * tx * (3 - 2 * tx)
+    ty = ty * ty * (3 - 2 * ty)
+    tz = tz * tz * (3 - 2 * tz)
+
+    def v(xx, yy, zz):
+        return valor_aleatorio_3d(xx, yy, zz, seed)
+
+    x00 = lerp(v(x0, y0, z0), v(x1, y0, z0), tx)
+    x10 = lerp(v(x0, y1, z0), v(x1, y1, z0), tx)
+    x01 = lerp(v(x0, y0, z1), v(x1, y0, z1), tx)
+    x11 = lerp(v(x0, y1, z1), v(x1, y1, z1), tx)
+    y0_ = lerp(x00, x10, ty)
+    y1_ = lerp(x01, x11, ty)
+    return lerp(y0_, y1_, tz)
 
 def ruido_suave(x, z, escala, seed=0):
     return (
@@ -380,7 +405,7 @@ def gerar_dados_relevo(cx, cz):
         return
 
     possiveis_locais_arvores = []
-    fundo_do_mundo = -12
+    fundo_do_mundo = -16
 
     for x in range(cx * TAMANHO_CHUNK, (cx + 1) * TAMANHO_CHUNK):
         for z in range(cz * TAMANHO_CHUNK, (cz + 1) * TAMANHO_CHUNK):
@@ -412,6 +437,14 @@ def gerar_dados_relevo(cx, cz):
                 pos = (x, y, z)
                 if pos in cache_mapa:
                     continue
+
+                # --- CAVERNAS: só no subsolo, longe da superfície e sem mexer em água ---
+                profundidade_superficie = altura_calculada - y
+                if not eh_agua and profundidade_superficie > 4 and y > fundo_do_mundo + 2:
+                    densidade_caverna = ruido_3d(x, y, z, 13, 200)
+                    if densidade_caverna > 0.74:
+                        continue  # bloco vazio = caverna
+
                 if y == altura_calculada:
                     if eh_agua or altura_calculada <= NIVEL_AGUA + 1:
                         cache_mapa[pos] = 'areia'
@@ -425,12 +458,23 @@ def gerar_dados_relevo(cx, cz):
                     cache_mapa[pos] = 'areia'
                 elif y >= altura_calculada - 3:
                     cache_mapa[pos] = cfg['subsolo']
+                elif y >= altura_calculada - 15:
+                    sorteio = random.random()
+                    if sorteio < 0.03:
+                        cache_mapa[pos] = 'ouro'
+                    elif sorteio < 0.10:
+                        cache_mapa[pos] = 'prata'
+                    elif sorteio < 0.25:
+                        cache_mapa[pos] = 'bronze'
+                    else:
+                        cache_mapa[pos] = 'pedra'
+                elif y <= fundo_do_mundo + 2:
+                    cache_mapa[pos] = 'bedrock'
                 else:
                     cache_mapa[pos] = 'pedra'
 
             if eh_agua:
                 chunks_com_agua.add((cx, cz))
-                # A água é apenas um marcador, o plano global cuida do visual.
                 for y in range(altura_calculada + 1, NIVEL_AGUA + 1):
                     pos_agua = (x, y, z)
                     if pos_agua not in cache_mapa:
@@ -793,6 +837,8 @@ def input(key):
             return
 
         if key == 'left mouse down':
+            if cache_mapa.get(coordenada_bloco) == 'bedrock':
+                return  # não deixa quebrar
             del cache_mapa[coordenada_bloco]
             alvo_x, _, alvo_z = coordenada_bloco
             solicitar_atualizacoes_do_bloco(alvo_x, alvo_z)
