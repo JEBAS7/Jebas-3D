@@ -77,7 +77,7 @@ plano_agua = Entity(
 plano_agua.setTransparency(TransparencyAttrib.MAlpha)
 
 ARQUIVO_SAVE = 'mundo_save.json'
-ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'agua', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
+ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'bronze', 'prata', 'ouro', 'madeira', 'folhas']
 bloco_selecionado = 'grama'
 indice_selecionado = 0
 
