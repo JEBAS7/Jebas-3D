@@ -89,7 +89,7 @@ jogador.gravity = 0
 jogador.speed = 0
 jogador.jump_height = 0
 
-pulos_extras = 1
+pulos_extras = 2
 velocidade_vertical = 0.0
 
 efeito_agua = Entity(parent=camera.ui, model='quad', scale=2,
@@ -165,6 +165,25 @@ def resetar_entidades_mundo():
     chunks_com_agua.clear()
 
 
+def garantir_dados_da_coluna(x, z):
+    """Garante que os dados de terreno da coluna (x, z) já existem em cache_mapa.
+
+    A geração de dados normalmente só acontece dentro de atualizar_malha_chunk,
+    que é enfileirada e processada aos poucos (1 chunk por frame, veja
+    processar_fila_chunks). Se o jogador anda rápido o bastante, ele pode
+    chegar a uma coluna cujo chunk ainda não tem dados: cache_mapa.get()
+    retorna None ali (como se fosse ar vazio), e a colisão deixa passar --
+    o jogador atravessa uma parede que ainda nem existe nos dados do jogo,
+    e some segundos depois, quando o chunk finalmente processa e a pedra
+    "aparece" ao redor dele. Aqui forçamos a geração dos DADOS (rápida,
+    sem construir a malha visual) na hora, então a colisão nunca compara
+    contra uma coluna vazia por falta de ter sido gerada ainda.
+    """
+    cx, cz = int(x) // TAMANHO_CHUNK, int(z) // TAMANHO_CHUNK
+    if (cx, cz) not in chunks_gerados:
+        gerar_dados_relevo(cx, cz)
+
+
 def altura_do_chao(x, z, y_referencia=None):
     """Encontra o topo sólido da coluna (ignora água/folhas/madeira).
 
@@ -174,6 +193,8 @@ def altura_do_chao(x, z, y_referencia=None):
     a função encontraria o teto (bloco sólido mais alto da coluna) e não o
     piso onde o jogador realmente está pisando.
     """
+    garantir_dados_da_coluna(x, z)
+
     if y_referencia is None:
         inicio = ALTURA_MAXIMA - 1
     else:
@@ -187,10 +208,21 @@ def altura_do_chao(x, z, y_referencia=None):
 
 
 def posicionar_jogador_na_superficie(x, z):
+    global velocidade_vertical
     cx, cz = x // TAMANHO_CHUNK, z // TAMANHO_CHUNK
     atualizar_malha_chunk(cx, cz)
-    y_chao = altura_do_chao(x, z)
-    jogador.position = (x, y_chao + 3, z)
+
+    # Antes, isso calculava a altura do "topo sólido" da coluna e colocava o
+    # jogador 3 acima -- mas em terreno de montanha isso pode achar uma
+    # saliência/overhang, uma caverna com teto baixo perto da superfície, ou
+    # até (perto do mar) uma coluna de oceano bem profunda, colocando o
+    # jogador embutido em pedra ou muito abaixo do nível real do chão. Em
+    # vez de confiar num cálculo isolado, soltamos o jogador de bem acima
+    # de qualquer altura possível do mundo e deixamos a MESMA física de
+    # queda/colisão usada durante o jogo normal (a função update()) achar
+    # o chão de verdade -- é a lógica que já testamos e sabemos que funciona.
+    velocidade_vertical = 0
+    jogador.position = (x, ALTURA_MAXIMA + 5, z)
 
 
 def mostrar_carregamento_novo():
@@ -228,6 +260,40 @@ def mostrar_carregamento_salvo():
     invoke(iniciar_mundo_carregado, delay=0.05)
 
 
+def carregar_dados_do_save():
+    """Lê o arquivo de save e devolve (blocos, chunks_ja_gerados).
+
+    Aceita tanto o formato novo ({'blocos': ..., 'chunks_gerados': ...})
+    quanto o formato antigo (um dict plano "x,y,z" -> tipo, sem a lista de
+    chunks), pra não quebrar saves feitos antes dessa correção -- nesse
+    caso não há como saber quais chunks já foram visitados, então tudo é
+    regenerado do zero como acontecia antes (não resolve saves antigos,
+    mas não trava o jogo neles).
+    """
+    with open(ARQUIVO_SAVE, 'r') as f:
+        dados_carregados = json.load(f)
+
+    if 'blocos' in dados_carregados:
+        blocos = dados_carregados['blocos']
+        chunks_salvos = dados_carregados.get('chunks_gerados', [])
+    else:
+        blocos = dados_carregados
+        chunks_salvos = []
+
+    return blocos, chunks_salvos
+
+
+def aplicar_dados_carregados(blocos, chunks_salvos):
+    for chave_string, tipo in blocos.items():
+        coordenadas = chave_string.split(',')
+        if len(coordenadas) == 3:
+            x, y, z = int(coordenadas[0]), int(coordenadas[1]), int(coordenadas[2])
+            cache_mapa[(x, y, z)] = tipo
+
+    for cx, cz in chunks_salvos:
+        chunks_gerados.add((int(cx), int(cz)))
+
+
 def iniciar_mundo_carregado():
     global cache_mapa, jogo_iniciado, velocidade_vertical
     jogo_iniciado = True
@@ -237,18 +303,13 @@ def iniciar_mundo_carregado():
     mouse.locked = True
     mouse.visible = False
 
-    with open(ARQUIVO_SAVE, 'r') as f:
-        dados_carregados = json.load(f)
+    blocos, chunks_salvos = carregar_dados_do_save()
 
     cache_mapa.clear()
     chunks_gerados.clear()
     chunks_com_agua.clear()
     resetar_entidades_mundo()
-    for chave_string, tipo in dados_carregados.items():
-        coordenadas = chave_string.split(',')
-        if len(coordenadas) == 3:
-            x, y, z = int(coordenadas[0]), int(coordenadas[1]), int(coordenadas[2])
-            cache_mapa[(x, y, z)] = tipo
+    aplicar_dados_carregados(blocos, chunks_salvos)
 
     posicionar_jogador_na_superficie(4, 4)
     gerenciar_chunks_visiveis()
@@ -259,11 +320,23 @@ def iniciar_mundo_carregado():
 
 
 def salvar_mundo():
-    dados_para_salvar = {}
+    dados_para_salvar = {
+        'blocos': {},
+        # Sem isso, o carregamento marca tudo como "nunca gerado" e o jogo
+        # regenera cada chunk do zero conforme você explora de novo. Blocos
+        # que você colocou têm um valor salvo, então voltam certinho -- mas
+        # um buraco (caverna natural ou túnel cavado por você) nunca teve
+        # um registro de "isso aqui é vazio", só ausência de dado. A
+        # regeneração então enche esse vazio de novo com pedra/minério,
+        # exatamente onde você pode estar parado. Salvando quais chunks já
+        # foram gerados, o carregamento nunca tenta regerar o que você já
+        # visitou, e os buracos continuam exatamente como você deixou.
+        'chunks_gerados': [[cx, cz] for cx, cz in chunks_gerados],
+    }
     for pos, tipo in cache_mapa.items():
         if tipo is not None:
             chave_string = f"{pos[0]},{pos[1]},{pos[2]}"
-            dados_para_salvar[chave_string] = tipo
+            dados_para_salvar['blocos'][chave_string] = tipo
     with open(ARQUIVO_SAVE, 'w') as f:
         json.dump(dados_para_salvar, f)
     alternar_menu_pausa()
@@ -281,17 +354,14 @@ def mostrar_carregamento_pausa():
 
 def carregar_mundo_pausa():
     global cache_mapa
-    with open(ARQUIVO_SAVE, 'r') as f:
-        dados_carregados = json.load(f)
+    blocos, chunks_salvos = carregar_dados_do_save()
+
     cache_mapa.clear()
     chunks_gerados.clear()
-    for chave_string, tipo in dados_carregados.items():
-        coordenadas = chave_string.split(',')
-        if len(coordenadas) == 3:
-            x, y, z = int(coordenadas[0]), int(coordenadas[1]), int(coordenadas[2])
-            cache_mapa[(x, y, z)] = tipo
-
+    chunks_com_agua.clear()
     resetar_entidades_mundo()
+    aplicar_dados_carregados(blocos, chunks_salvos)
+
     posicionar_jogador_na_superficie(4, 4)
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
@@ -451,9 +521,19 @@ def gerar_dados_relevo(cx, cz):
                 if pos in cache_mapa:
                     continue
 
-                # --- CAVERNAS: só no subsolo, longe da superfície e sem mexer em água ---
+                # --- CAVERNAS: só no subsolo, longe da superfície, sem mexer em água
+                # e nunca abaixo do nível do mar ---
+                # A checagem "not eh_agua" só olha a coluna ATUAL (x, z). Ela não
+                # impede nada: uma caverna esculpida numa coluna de montanha pode
+                # ir fundo o bastante (y <= NIVEL_AGUA) pra encostar numa coluna de
+                # oceano vizinha, que é água até esse mesmo nível. Sem pedra entre
+                # as duas colunas, a caverna simplesmente abre um buraco direto pro
+                # oceano. Por isso também exigimos y > NIVEL_AGUA aqui: caverna
+                # nunca existe na faixa de profundidade onde mares/lagos têm água,
+                # então nunca pode encostar neles, não importa a coluna vizinha.
                 profundidade_superficie = altura_calculada - y
-                if not eh_agua and profundidade_superficie > 4 and y > fundo_do_mundo + 2:
+                if (not eh_agua and profundidade_superficie > 4
+                        and y > fundo_do_mundo + 2 and y > NIVEL_AGUA):
                     densidade_caverna = ruido_3d(x, y, z, 13, 200)
                     if densidade_caverna > 0.74:
                         continue  # bloco vazio = caverna
@@ -572,7 +652,7 @@ def atualizar_malha_chunk(cx, cz):
 
         # CORREÇÃO DO BUG BRANCO: double_sided=False e camera frustum culling
         opcoes = {'parent': scene, 'model': malha, 'texture': TEXTURAS_BLOCOS[tipo],
-                  'double_sided': True, 'collider': True}
+                  'double_sided': True, 'collider': None}
         sub_malhas_do_chunk.append(Entity(**opcoes))
 
     if sub_malhas_do_chunk:
@@ -623,6 +703,7 @@ def coluna_livre_para_jogador(ponto):
     jogador ocupa.
     """
     base = coordenada_do_ponto(ponto)
+    garantir_dados_da_coluna(base[0], base[2])
     for dy in (0, 1):
         tipo = cache_mapa.get((base[0], base[1] + dy, base[2]))
         if tipo is not None and tipo != 'agua':
