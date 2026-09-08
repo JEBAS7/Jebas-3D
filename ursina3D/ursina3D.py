@@ -261,14 +261,15 @@ def mostrar_carregamento_salvo():
 
 
 def carregar_dados_do_save():
-    """Lê o arquivo de save e devolve (blocos, chunks_ja_gerados).
+    """Lê o arquivo de save e devolve (blocos, chunks_ja_gerados, posicao_salva).
 
-    Aceita tanto o formato novo ({'blocos': ..., 'chunks_gerados': ...})
-    quanto o formato antigo (um dict plano "x,y,z" -> tipo, sem a lista de
-    chunks), pra não quebrar saves feitos antes dessa correção -- nesse
-    caso não há como saber quais chunks já foram visitados, então tudo é
-    regenerado do zero como acontecia antes (não resolve saves antigos,
-    mas não trava o jogo neles).
+    Aceita tanto o formato novo ({'blocos': ..., 'chunks_gerados': ...,
+    'jogador_pos': ...}) quanto o formato antigo (um dict plano "x,y,z" ->
+    tipo, sem chunks nem posição), pra não quebrar saves feitos antes dessa
+    correção -- nesse caso não há como saber quais chunks já foram
+    visitados nem onde o jogador estava, então o mundo é regenerado do
+    zero e o jogador nasce no ponto fixo (não resolve saves antigos, mas
+    não trava o jogo neles).
     """
     with open(ARQUIVO_SAVE, 'r') as f:
         dados_carregados = json.load(f)
@@ -276,11 +277,13 @@ def carregar_dados_do_save():
     if 'blocos' in dados_carregados:
         blocos = dados_carregados['blocos']
         chunks_salvos = dados_carregados.get('chunks_gerados', [])
+        posicao_salva = dados_carregados.get('jogador_pos')
     else:
         blocos = dados_carregados
         chunks_salvos = []
+        posicao_salva = None
 
-    return blocos, chunks_salvos
+    return blocos, chunks_salvos, posicao_salva
 
 
 def aplicar_dados_carregados(blocos, chunks_salvos):
@@ -294,6 +297,42 @@ def aplicar_dados_carregados(blocos, chunks_salvos):
         chunks_gerados.add((int(cx), int(cz)))
 
 
+def restaurar_ou_reposicionar_jogador(posicao_salva):
+    """Restaura o jogador perto de onde ele salvou, com um teto de segurança.
+
+    Como o terreno das áreas já visitadas fica idêntico ao que era antes de
+    salvar (graças a chunks_gerados persistido), a posição salva devia
+    sempre ser um lugar seguro. Mas o save pode ter capturado a posição num
+    frame ruim (por exemplo, no meio de um degrau ou logo após pisar em
+    algo), então em vez de aceitar cegamente o ponto exato ou desistir dele
+    de vez (mandando pro spawn fixo, longe de onde o jogador estava),
+    subimos célula por célula a partir da posição salva até achar espaço
+    livre de verdade -- é basicamente automatizar o "pular pra sair" que
+    você teria que fazer na mão.
+    """
+    global velocidade_vertical
+
+    if posicao_salva and len(posicao_salva) == 3:
+        x, y, z = posicao_salva
+        garantir_dados_da_coluna(x, z)
+
+        y_base = math.floor(y)
+        for tentativa_y in range(y_base, y_base + 8):
+            if coluna_livre_para_jogador(Vec3(x, tentativa_y, z)):
+                velocidade_vertical = 0
+                jogador.position = (x, tentativa_y, z)
+                return
+
+        # Nada livre por perto do ponto salvo: solta de cima nesse mesmo
+        # x, z (sem abandonar o lugar) e deixa a física de queda normal
+        # achar o chão de verdade.
+        velocidade_vertical = 0
+        jogador.position = (x, ALTURA_MAXIMA + 5, z)
+        return
+
+    posicionar_jogador_na_superficie(4, 4)
+
+
 def iniciar_mundo_carregado():
     global cache_mapa, jogo_iniciado, velocidade_vertical
     jogo_iniciado = True
@@ -303,7 +342,7 @@ def iniciar_mundo_carregado():
     mouse.locked = True
     mouse.visible = False
 
-    blocos, chunks_salvos = carregar_dados_do_save()
+    blocos, chunks_salvos, posicao_salva = carregar_dados_do_save()
 
     cache_mapa.clear()
     chunks_gerados.clear()
@@ -311,7 +350,7 @@ def iniciar_mundo_carregado():
     resetar_entidades_mundo()
     aplicar_dados_carregados(blocos, chunks_salvos)
 
-    posicionar_jogador_na_superficie(4, 4)
+    restaurar_ou_reposicionar_jogador(posicao_salva)
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
@@ -322,6 +361,7 @@ def iniciar_mundo_carregado():
 def salvar_mundo():
     dados_para_salvar = {
         'blocos': {},
+        'jogador_pos': [jogador.x, jogador.y, jogador.z],
         # Sem isso, o carregamento marca tudo como "nunca gerado" e o jogo
         # regenera cada chunk do zero conforme você explora de novo. Blocos
         # que você colocou têm um valor salvo, então voltam certinho -- mas
@@ -339,7 +379,16 @@ def salvar_mundo():
             dados_para_salvar['blocos'][chave_string] = tipo
     with open(ARQUIVO_SAVE, 'w') as f:
         json.dump(dados_para_salvar, f)
-    alternar_menu_pausa()
+    # Fechar o menu na hora (em vez de adiar pro próximo frame, como o
+    # carregamento já faz) deixava uma brecha: o clique em "SALVAR MUNDO" é
+    # um evento bruto de mouse que o jogo também recebe no input() global.
+    # Se o menu já tivesse fechado antes desse evento terminar de ser
+    # processado, a checagem "menu_pausa.enabled" já via False, e o mesmo
+    # clique também minerava o bloco mirado pela câmera -- cavando o chão
+    # debaixo do jogador bem na hora de salvar. Adiando o fechamento pro
+    # próximo frame, o menu continua "aberto" (bloqueando mineração) durante
+    # todo o processamento desse clique.
+    invoke(alternar_menu_pausa, delay=0.05)
 
 
 def mostrar_carregamento_pausa():
@@ -354,7 +403,7 @@ def mostrar_carregamento_pausa():
 
 def carregar_mundo_pausa():
     global cache_mapa
-    blocos, chunks_salvos = carregar_dados_do_save()
+    blocos, chunks_salvos, posicao_salva = carregar_dados_do_save()
 
     cache_mapa.clear()
     chunks_gerados.clear()
@@ -362,7 +411,7 @@ def carregar_mundo_pausa():
     resetar_entidades_mundo()
     aplicar_dados_carregados(blocos, chunks_salvos)
 
-    posicionar_jogador_na_superficie(4, 4)
+    restaurar_ou_reposicionar_jogador(posicao_salva)
     gerenciar_chunks_visiveis()
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
@@ -920,7 +969,7 @@ def input(key):
         alternar_menu_pausa()
         return
 
-    if menu_pausa.enabled:
+    if menu_pausa.enabled or tela_carregamento.enabled:
         return
 
     if key == 'space' and not jogador_esta_na_agua() and jogador.grounded:
@@ -1001,6 +1050,21 @@ def update():
     esta_na_agua = jogador_esta_na_agua()
     efeito_agua.enabled = esta_na_agua
 
+    # [FIX] Limitamos (clamp) o dt usado na física. Sem isso, se um frame
+    # qualquer demorar muito no mundo real (por exemplo, logo depois de
+    # fechar o menu de pausa, salvar, carregar, ou gerar vários chunks de
+    # uma vez), o Ursina reporta um time.dt gigante nesse frame seguinte.
+    # Como multiplicamos velocidade e posição por time.dt diretamente, um
+    # dt inflado fazia o jogador cair várias unidades de uma vez só nesse
+    # ÚNICO frame -- rápido demais pra colisão pegar no meio do caminho --
+    # atravessando o chão de vez (era exatamente o "SALTO ANORMAL DE Y" que
+    # os logs de debug mostraram, ex: 8.0 -> -7.0 num frame só). O jogo
+    # então "escalava" de volta 1 bloco por frame até a superfície, o que
+    # parecia um bug de colisão mas na real era esse dt sem limite. 0.05
+    # equivale a no mínimo ~20 quadros por segundo de física por frame,
+    # suficiente pra qualquer soluço não atravessar um bloco inteiro.
+    dt = min(time.dt, 0.05)
+
     if esta_na_agua:
         # --- MODO NATAÇÃO ---
         velocidade_vertical = 0
@@ -1019,7 +1083,7 @@ def update():
         if held_keys['a']: movimento_horizontal -= direcao_lado
 
         if movimento_horizontal.length() > 0:
-            movimento_horizontal = movimento_horizontal.normalized() * VELOCIDADE_NADO * time.dt
+            movimento_horizontal = movimento_horizontal.normalized() * VELOCIDADE_NADO * dt
             jogador.position += movimento_horizontal
 
         alvo_vertical = 0.0
@@ -1031,7 +1095,7 @@ def update():
         if not held_keys['space'] and not held_keys['shift'] and abs(camera.forward.y) > 0.12:
             alvo_vertical = camera.forward.y * VELOCIDADE_VERTICAL_NADO
 
-        jogador.y += alvo_vertical * time.dt
+        jogador.y += alvo_vertical * dt
 
         if jogador.y > NIVEL_AGUA + 0.9 and not held_keys['space']:
             jogador.y = NIVEL_AGUA + 0.9
@@ -1042,8 +1106,8 @@ def update():
 
     else:
         # --- MODO TERRA ---
-        velocidade_vertical -= 25 * time.dt
-        jogador.y += velocidade_vertical * time.dt
+        velocidade_vertical -= 25 * dt
+        jogador.y += velocidade_vertical * dt
 
         y_chao_atual = altura_do_chao(jogador.x, jogador.z, jogador.y)
         if jogador.y <= y_chao_atual + 1.0:
@@ -1069,7 +1133,7 @@ def update():
         if held_keys['a']: movimento_horizontal -= direcao_lado
 
         if movimento_horizontal.length() > 0:
-            movimento_horizontal = movimento_horizontal.normalized() * velocidade_andar * time.dt
+            movimento_horizontal = movimento_horizontal.normalized() * velocidade_andar * dt
 
             # Testamos X e Z separadamente (em vez do ponto de destino combinado)
             # para o jogador poder "deslizar" ao longo da parede da caverna em
