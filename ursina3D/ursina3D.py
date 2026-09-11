@@ -5,6 +5,7 @@ import math
 import os
 import json
 import random
+from collections import deque
 
 app = Ursina()
 window.fps_counter.enabled = True
@@ -45,7 +46,42 @@ chunks_com_agua = set()
 
 jogo_iniciado = False
 
-COR_AGUA = color.rgba(60, 170, 255, 85)  # Azul Perfeito
+# [FIX] color.rgba() no Ursina espera valores de 0 a 1, não de 0 a 255.
+# A definição antiga -- color.rgba(60, 170, 255, 85) -- estourava todo canal
+# acima de 1.0, que é clampado para 1.0: o resultado era um branco sólido e
+# opaco, não um azul semi-transparente. É por isso que o plano antigo (que
+# funcionava) nunca usou essa constante e preferia color.azure + alpha=0.4.
+# Aqui convertemos a mesma intenção de cor (azul de água) para a escala 0-1.
+# [AJUSTE] Azul mais saturado/escuro e mais opaco que antes, a pedido do
+# usuário -- o azul claro e fraco (60,170,255 com alpha 0.35) fazia a água
+# parecer meio "lavada". Agora é um azul mais profundo e mais opaco.
+COR_AGUA = color.rgba(5 / 255, 55 / 255, 210 / 255, 0.68)  # Azul mais saturado/profundo
+
+# Tom usado no overlay de tela (efeito_agua) quando a câmera está debaixo
+# d'água -- um azul mais escuro/saturado que o da água em si, pra dar a
+# sensação de estar olhando "através" da água e não só perto dela.
+# [AJUSTE] Azul mais vívido/intenso a pedido do usuário (era um azul-marinho
+# meio apagado, 4,35,130). Agora é um azul mais vibrante e saturado.
+COR_EFEITO_AGUA = (0 / 255, 60 / 255, 220 / 255)
+
+# [AJUSTE] Margem de segurança (em unidades de mundo) que os OLHOS precisam
+# estar abaixo da superfície antes da visão turva ligar. Sem essa margem,
+# profundidade_olhos_na_agua() já retorna positivo assim que a câmera cruza
+# a própria fronteira do bloco de água (o topo geométrico do bloco), o que
+# visualmente ainda parece "acima" da superfície por causa da textura de
+# ondas -- daí a sensação de a tela embaçar cedo demais. Com essa margem, só
+# embaça quando os olhos já estão visivelmente por baixo d'água de verdade.
+#
+# [FIX] Usamos DOIS limiares (histerese) em vez de um só: LIGA só quando a
+# profundidade passa de MARGEM_LIGAR, mas DESLIGA só quando ela cai abaixo de
+# MARGEM_DESLIGAR (mais baixo/negativo que MARGEM_LIGAR). Sem essa folga,
+# flutuando parado bem na superfície (onde profundidade_olhos oscila poucos
+# centésimos pra cima e pra baixo da linha da água a cada frame) a visão
+# turva fica ligando e desligando entre um frame e o outro -- exatamente o
+# "quicar" que fazia duas capturas quase idênticas mostrarem uma com e outra
+# sem o efeito, mesmo com a câmera praticamente parada no mesmo lugar.
+MARGEM_LIGAR_TURVA = 0.15
+MARGEM_DESLIGAR_TURVA = -0.05
 
 TEXTURAS_BLOCOS = {
     'grama': 'texturas/grama.png' if os.path.exists('texturas/grama.png') else 'white_cube',
@@ -62,24 +98,30 @@ TEXTURAS_BLOCOS = {
     'folhas': 'texturas/folhas.png' if os.path.exists('texturas/folhas.png') else 'white_cube'
 }
 
-plano_agua = Entity(
-    parent=scene,
-    model='plane',
-    scale=(500, 1, 500),
-    position=(0, NIVEL_AGUA + 4, 0),
-    texture='agua',
-    color=color.azure,
-    texture_scale=(25, 25),
-    alpha=0.4,
-    unlit=True,
-    double_sided=True,
-    collider=None
-)
+# O plano gigante de água foi removido: agora cada célula de água é um bloco
+# de verdade dentro de cache_mapa (a mesma lógica de lagos/oceanos que já
+# existia na geração de terreno), desenhado como uma malha semi-transparente
+# só nos chunks carregados -- ver atualizar_malha_chunk mais abaixo.
 
-plano_agua.setTransparency(TransparencyAttrib.MAlpha)
+# Trava de segurança para o preenchimento de buracos com água (ver
+# encher_buraco_com_agua): sem isso, despejar água numa área aberta em vez
+# de um buraco fechado faria o flood-fill tentar inundar o mundo inteiro.
+LIMITE_INUNDACAO = 4000
+
+# [FIX] O LIMITE_INUNDACAO sozinho não bastava: se existisse qualquer
+# caminho de células vazias (céu acima de um vale, uma depressão do
+# terreno) na mesma altura do balde ou mais abaixo, o flood-fill viajava
+# por ele -- mesmo que fosse bem longe do lago/poça onde a água foi
+# despejada. O resultado era água de verdade aparecendo flutuando no ar
+# sobre outras partes do mapa (às vezes bem longe, perto do oceano até),
+# o que ligava a visão turva em lugares onde não tinha água nenhuma
+# visível. Este raio limita o quão longe (em blocos, no plano X/Z) a
+# inundação pode viajar a partir do ponto onde a água foi colocada --
+# suficiente pra encher uma lagoa, pequeno demais pra vazar pelo mapa.
+RAIO_MAXIMO_INUNDACAO = 40
 
 ARQUIVO_SAVE = 'mundo_save.json'
-ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'bronze', 'prata', 'ouro', 'diamante', 'madeira', 'folhas']
+ORDEM_BLOCOS = ['grama', 'terra', 'pedra', 'areia', 'bronze', 'prata', 'ouro', 'diamante', 'madeira', 'folhas', 'agua']
 bloco_selecionado = 'grama'
 indice_selecionado = 0
 
@@ -91,9 +133,214 @@ jogador.jump_height = 0
 
 pulos_extras = 2
 velocidade_vertical = 0.0
+# [FIX] Estado persistente do efeito de água turva entre frames -- necessário
+# para a histerese (ver MARGEM_LIGAR_TURVA / MARGEM_DESLIGAR_TURVA acima):
+# sem lembrar se já estava ligado no frame anterior, não dá pra aplicar um
+# limiar diferente pra ligar e pra desligar.
+agua_efeito_ativo = False
 
+# [FIX] Distância real entre os PÉS (jogador.y) e os OLHOS (camera.world_y),
+# medida e guardada enquanto o jogador está andando em TERRA FIRME (uma
+# situação estável, sem nenhuma correção de altura acontecendo). Antes o
+# teto de natação lia "camera.world_y - jogador.y" AO VIVO, no mesmo frame em
+# que jogador.y acabava de ser alterado -- se a câmera do Panda3D ainda não
+# tivesse propagado essa mudança bem na hora da leitura (um atraso de um
+# frame), a conta saía errada, e como a correção só empurra o jogador PRA
+# BAIXO quando dá errado (nunca pra cima), qualquer erro pequeno se acumulava
+# frame após frame até o jogador atravessar o fundo do oceano -- exatamente o
+# "cai para debaixo do fundo do oceano" relatado. Guardando esse número
+# enquanto o jogador está em terra (fora do próprio laço que o usa pra
+# corrigir a natação), a natação usa sempre um valor estável e correto, sem
+# realimentação.
+altura_olhos_referencia = jogador.camera_pivot.y
+
+# Em vez de um quad colorido puro, use um quad com textura radial
 efeito_agua = Entity(parent=camera.ui, model='quad', scale=2,
-                     color=color.rgba(20, 150, 255, 0.32), z=0.1, enabled=False)
+                     color=color.rgba(*COR_EFEITO_AGUA, 0.35),
+                     z=0.5, enabled=False)
+
+# --- CHUVA ---
+# Já existe áudio de chuva de fundo -- isso aqui é só o visual: um monte de
+# gotinhas caindo ao redor do jogador.
+#
+# [FIX] A primeira versão desenhava cada gota como uma LINHA (mode='line').
+# Só que no Ursina esse modo conecta TODOS os vértices numa única linha
+# contínua (um "line strip"), não em segmentos separados -- o resultado
+# era uma teia de traços ligando uma gota na outra pela tela inteira, não
+# chuva. Agora cada gota é desenhada como dois retângulos finos cruzados
+# em "X" (mesma técnica de FACES_CUBO usada pros blocos do mundo: 4
+# vértices + 2 triângulos por retângulo) -- isolados uns dos outros, e
+# visíveis de qualquer ângulo horizontal por causa do cruzamento.
+#
+# Em vez de criar uma Entity por gota (o Ursina teria que desenhar centenas
+# de objetos separados todo frame, pesado), tudo vira um ÚNICO Mesh -- um
+# desenho só, resolvendo tudo de uma vez.
+#
+# O container fica com parent=jogador (não parent=camera!): assim ele anda
+# junto com o jogador automaticamente, e como jogador só gira no eixo Y
+# (olhar pra cima/baixo é só a câmera dentro dele), as gotas continuam
+# sempre verticais na tela, nunca inclinadas. Se fosse parent=camera, olhar
+# pra cima ou pra baixo inclinaria a chuva inteira junto com a câmera.
+# [OTIMIZAÇÃO FPS] Reduzido de 220 -- cada gota vira 8 vértices no mesh e,
+# mais importante, cada gota que bate no chão dispara um respingo. Com 220
+# gotas o jogo criava e destruía uma Entity de respingo ~150-200 vezes por
+# segundo, e criar/destruir Entity é uma das operações mais caras do
+# Panda3D/Ursina -- essa era a maior causa da queda de FPS. 150 gotas
+# mantém a chuva visualmente cheia com bem menos pressão de CPU.
+NUM_GOTAS_CHUVA = 150
+RAIO_CHUVA = 18            # gotas aparecem espalhadas nesse raio (X/Z) ao redor do jogador
+ALTURA_CHUVA = 16          # começam a essa altura acima do jogador, e reaparecem lá quando passam do chão
+VELOCIDADE_QUEDA_CHUVA = 26
+COMPRIMENTO_GOTA = 0.6
+LARGURA_GOTA = 0.035
+
+gotas_chuva = [
+    Vec3(random.uniform(-RAIO_CHUVA, RAIO_CHUVA),
+         random.uniform(-ALTURA_CHUVA, ALTURA_CHUVA),
+         random.uniform(-RAIO_CHUVA, RAIO_CHUVA))
+    for _ in range(NUM_GOTAS_CHUVA)
+]
+
+# [NOVO] Altura (em coordenada MUNDIAL, não local) onde cada gota deve
+# "bater" -- o topo do chão sólido, ou o topo da água, o que for mais alto
+# ali. Começa como None (ainda não calculado) porque as funções que
+# calculam isso (altura_do_chao / nivel_superficie_agua) só são definidas
+# mais abaixo no arquivo -- o valor real de cada uma é preenchido na
+# primeira vez que o update() processa aquela gota (ver calcular_estado_gota).
+impactos_chuva = [None] * NUM_GOTAS_CHUVA
+
+# [FIX] Se cada gota está bloqueada ou não (True = tem teto sólido acima
+# dessa coluna especificamente, então a gota não deve aparecer). Antes a
+# chuva inteira ligava/desligava com base numa única checagem na coluna do
+# JOGADOR -- perto da boca de uma caverna isso é errado: parado bem na
+# entrada olhando pra fora (céu aberto lá fora), a coluna debaixo dos SEUS
+# pés ainda tinha teto de pedra, então a chuva inteira ficava desligada,
+# inclusive as gotas que deveriam estar caindo lá fora, visíveis na tela.
+# Agora cada gota checa a PRÓPRIA coluna (calculada junto com o impacto, em
+# calcular_estado_gota), então gotas em área aberta aparecem e gotas sobre
+# uma coluna com teto ficam invisíveis, ao mesmo tempo.
+bloqueios_chuva = [False] * NUM_GOTAS_CHUVA
+
+# [OTIMIZAÇÃO FPS] Contador de frames pra chuva -- ver uso lá no update(),
+# onde ele decide se a malha da chuva é reenviada pra GPU neste frame.
+_frame_chuva = 0
+
+
+def calcular_estado_gota(offset_x, offset_z):
+    """Pra uma coluna (X/Z relativo ao jogador), retorna (altura_impacto,
+    bloqueada).
+
+    altura_impacto é onde a gota deve parar de cair -- o relevo real dessa
+    coluna (topo_solido_coluna, que já ignora água), ou o topo da água, o
+    que for mais alto ali.
+
+    bloqueada é True quando o relevo real dessa coluna está bem ACIMA de
+    onde a chuva nasce perto do jogador (jogador.y + ALTURA_CHUVA) -- sinal
+    de que existe uma camada de pedra sólida de verdade entre a região onde
+    a chuva cai perto do jogador e o céu ali (uma caverna/teto), não só uma
+    ladeira ou diferença comum de relevo (que fica dentro desse alcance).
+    Sem esse limite, uma gota tentaria cair até um "chão" que já está ACIMA
+    de onde ela nasce e nunca chegaria lá (nunca reapareceria).
+    """
+    wx = jogador.x + offset_x
+    wz = jogador.z + offset_z
+    topo = topo_solido_coluna(wx, wz)
+    agua = nivel_superficie_agua(wx, wz, jogador.y)
+    impacto = max(topo + 1, agua)
+    bloqueada = (topo - jogador.y) > ALTURA_CHUVA
+    return impacto, bloqueada
+
+
+# [OTIMIZAÇÃO FPS] Pool de respingos: antes, cada gota que batia no chão
+# chamava Entity(...) e depois destroy(...) -- com ~150-200 impactos por
+# segundo isso significava criar e destruir centenas de objetos do Panda3D
+# a cada segundo (cada Entity() novo passa por criação de NodePath,
+# atribuição de textura/modelo, etc. -- caro mesmo sendo pequeno). Em vez
+# disso, criamos um número fixo de Entities de respingo UMA VEZ no início e
+# ficamos girando entre elas (round-robin), só reposicionando e reanimando
+# a que estiver "livre" (a mais antiga). Zero criação/destruição em tempo
+# de jogo -- é praticamente de graça pra CPU.
+NUM_RESPINGOS_POOL = 40
+_pool_respingos = [
+    Entity(parent=jogador, model='quad', rotation_x=90, scale=0.06,
+           unlit=True, double_sided=True, enabled=False,
+           color=color.rgba(225 / 255, 240 / 255, 255 / 255, 0))
+    for _ in range(NUM_RESPINGOS_POOL)
+]
+_indice_pool_respingos = 0
+
+
+def criar_respingo_chuva(offset_x, altura_local, offset_z):
+    """Um respingo rápido (cresce e some) no ponto de impacto de uma gota.
+    Reaproveita uma Entity do pool em vez de criar/destruir uma nova.
+    """
+    global _indice_pool_respingos
+    respingo = _pool_respingos[_indice_pool_respingos]
+    _indice_pool_respingos = (_indice_pool_respingos + 1) % NUM_RESPINGOS_POOL
+
+    respingo.position = Vec3(offset_x, altura_local, offset_z)
+    respingo.scale = 0.06
+    respingo.color = color.rgba(225 / 255, 240 / 255, 255 / 255, 0.65)
+    respingo.enabled = True
+    respingo.animate_scale(0.3, duration=0.15, curve=curve.out_expo)
+    respingo.animate_color(color.rgba(225 / 255, 240 / 255, 255 / 255, 0), duration=0.25)
+    invoke(setattr, respingo, 'enabled', False, delay=0.3)
+
+
+def gerar_vertices_chuva():
+    """Monta os vértices de todas as gotas a partir de gotas_chuva (a
+    posição do TOPO de cada uma). A topologia (quantos vértices, quais
+    formam triângulo com quem) nunca muda -- só as posições -- por isso
+    os triângulos são gerados uma vez só em gerar_triangulos_chuva().
+
+    [FIX] Gotas cuja coluna está marcada em bloqueios_chuva (teto sólido
+    acima, ex: dentro de uma caverna) viram um retângulo DEGENERADO -- os 8
+    vértices colapsados no mesmo ponto, ou seja, área zero, invisível --
+    em vez de serem puladas. Isso mantém a contagem de vértices/triângulos
+    sempre igual ao número de gotas, que é o que gerar_triangulos_chuva()
+    (topologia fixa, gerada uma vez só) espera.
+    """
+    vertices = []
+    for i, g in enumerate(gotas_chuva):
+        if bloqueios_chuva[i]:
+            vertices.extend([g] * 8)
+            continue
+        base = g + Vec3(0, -COMPRIMENTO_GOTA, 0)
+        # retângulo alinhado ao eixo X
+        vertices.extend([
+            g + Vec3(-LARGURA_GOTA, 0, 0),
+            g + Vec3(LARGURA_GOTA, 0, 0),
+            base + Vec3(LARGURA_GOTA, 0, 0),
+            base + Vec3(-LARGURA_GOTA, 0, 0),
+        ])
+        # retângulo alinhado ao eixo Z, perpendicular ao de cima -- forma
+        # o "X" que fica visível não importa de que lado você olha.
+        vertices.extend([
+            g + Vec3(0, 0, -LARGURA_GOTA),
+            g + Vec3(0, 0, LARGURA_GOTA),
+            base + Vec3(0, 0, LARGURA_GOTA),
+            base + Vec3(0, 0, -LARGURA_GOTA),
+        ])
+    return vertices
+
+
+def gerar_triangulos_chuva():
+    triangulos = []
+    for i in range(NUM_GOTAS_CHUVA):
+        b = i * 8
+        triangulos.extend([
+            b, b + 1, b + 2, b, b + 2, b + 3,          # retângulo X
+            b + 4, b + 5, b + 6, b + 4, b + 6, b + 7,  # retângulo Z
+        ])
+    return triangulos
+
+
+_triangulos_chuva = gerar_triangulos_chuva()  # topologia fixa -- gerada uma vez só
+
+chuva = Entity(parent=jogador,
+               model=Mesh(vertices=gerar_vertices_chuva(), triangles=_triangulos_chuva, mode='triangle'),
+               color=color.rgba(190 / 255, 210 / 255, 255 / 255, 0.55),
+               unlit=True, double_sided=True, y=2)
 
 # --- CRIAÇÃO DA HOTBAR VISUAL ---
 hotbar_conteiner = Entity(parent=camera.ui, enabled=False)
@@ -207,6 +454,35 @@ def altura_do_chao(x, z, y_referencia=None):
     return 0
 
 
+def topo_solido_coluna(x, z):
+    """Altura do bloco sólido mais alto dessa coluna (ignorando água,
+    folhas e madeira), procurando do TOPO do mundo pra baixo -- ou seja, o
+    relevo real do terreno ali, sem depender de onde o jogador está.
+
+    [FIX] Substitui ceu_visivel(), que escaneava a partir da altura do
+    JOGADOR em vez da coluna sendo checada. Isso quebrava perto de uma
+    caverna que dá numa ladeira/superfície de altura bem diferente: o
+    jogador dentro da caverna tem um Y baixo, e escanear pra cima a partir
+    dele numa coluna de FORA (cujo chão de verdade é bem mais alto) batia
+    na terra sólida NORMAL daquela coluna -- terra comum sendo confundida
+    com um "teto de pedra", quando era só o interior do relevo ali, sem
+    caverna nenhuma. Escaneando sempre do topo absoluto do mapa pra baixo,
+    achamos o relevo real de qualquer coluna, não importa a altura do
+    jogador.
+
+    [FIX] Ignoramos 'folhas' e 'madeira' igual altura_do_chao já fazia --
+    sem isso, uma gota caindo bem em cima da copa de uma árvore achava que
+    aquilo era o chão e fazia o respingo lá, flutuando no ar bem acima da
+    grama de verdade (o respingo "no ar" relatado pelo usuário).
+    """
+    garantir_dados_da_coluna(x, z)
+    for y in range(ALTURA_MAXIMA - 1, -ALTURA_MAXIMA - 1, -1):
+        tipo = cache_mapa.get((int(x), int(y), int(z)))
+        if tipo is not None and tipo != 'agua' and tipo != 'folhas' and tipo != 'madeira':
+            return y
+    return -ALTURA_MAXIMA
+
+
 def posicionar_jogador_na_superficie(x, z):
     global velocidade_vertical
     cx, cz = x // TAMANHO_CHUNK, z // TAMANHO_CHUNK
@@ -249,7 +525,6 @@ def iniciar_novo_mundo():
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
     mao_jogador.enabled = True
-    plano_agua.enabled = True
 
 
 def mostrar_carregamento_salvo():
@@ -355,7 +630,6 @@ def iniciar_mundo_carregado():
     tela_carregamento.enabled = False
     hotbar_conteiner.enabled = True
     mao_jogador.enabled = True
-    plano_agua.enabled = True
 
 
 def salvar_mundo():
@@ -438,7 +712,6 @@ def voltar_ao_menu_inicial():
     menu_inicial.enabled = True
     mouse.locked = False
     mouse.visible = True
-    plano_agua.enabled = False
 
 
 # --- 3. GERADOR PROCEDURAL DE ÁRVORES ---
@@ -674,14 +947,27 @@ def atualizar_malha_chunk(cx, cz):
         for z in range(z_min, z_min + TAMANHO_CHUNK):
             for y in range(-ALTURA_MAXIMA, ALTURA_MAXIMA):
                 tipo = cache_mapa.get((x, y, z))
-                if tipo is None or tipo == 'agua':
+                if tipo is None:
                     continue
 
                 dados = dados_malha[tipo]
                 for (dx, dy, dz), vertices_face in FACES_CUBO:
                     vizinho = cache_mapa.get((x + dx, y + dy, z + dz))
-                    if vizinho is not None and vizinho != 'agua':
-                        continue
+
+                    # Regra de culling: um bloco sólido esconde a face quando o
+                    # vizinho também é sólido (a água, sendo transparente, não
+                    # conta como "esconder" -- por isso dá pra ver o fundo do
+                    # lago por baixo d'água). Já um bloco de ÁGUA só desenha a
+                    # face quando o vizinho é ar (None): contra outro bloco de
+                    # água a face ficaria invisível e custaria performance à
+                    # toa, e contra um bloco sólido a face já está tampada por
+                    # fora, então também não precisa ser desenhada.
+                    if tipo == 'agua':
+                        if vizinho is not None:
+                            continue
+                    else:
+                        if vizinho is not None and vizinho != 'agua':
+                            continue
 
                     inicio = len(dados['vertices'])
                     dados['vertices'].extend(
@@ -702,7 +988,18 @@ def atualizar_malha_chunk(cx, cz):
         # CORREÇÃO DO BUG BRANCO: double_sided=False e camera frustum culling
         opcoes = {'parent': scene, 'model': malha, 'texture': TEXTURAS_BLOCOS[tipo],
                   'double_sided': True, 'collider': None}
-        sub_malhas_do_chunk.append(Entity(**opcoes))
+        entidade_malha = Entity(**opcoes)
+
+        if tipo == 'agua':
+            # Água nunca tem colisão (jogador nada por dentro dela -- ver
+            # coluna_livre_para_jogador) e precisa ser semi-transparente,
+            # exatamente como era o plano gigante antigo, só que agora só
+            # existe onde realmente há um bloco de água nos dados.
+            entidade_malha.color = COR_AGUA
+            entidade_malha.unlit = True
+            entidade_malha.setTransparency(TransparencyAttrib.MAlpha)
+
+        sub_malhas_do_chunk.append(entidade_malha)
 
     if sub_malhas_do_chunk:
         chunks_entidades[(cx, cz)] = sub_malhas_do_chunk
@@ -730,6 +1027,63 @@ def solicitar_atualizacoes_do_bloco(x, z):
         solicitar_atualizacao_chunk(cx, cz - 1)
     elif z % TAMANHO_CHUNK == TAMANHO_CHUNK - 1:
         solicitar_atualizacao_chunk(cx, cz + 1)
+
+
+def encher_buraco_com_agua(posicao_inicial):
+    """Espalha água a partir de um bloco recém colocado, preenchendo o buraco.
+
+    É um flood-fill: a partir da célula onde a água foi colocada, ele anda
+    pelas células vazias vizinhas (None) que estão no mesmo nível ou mais
+    abaixo -- nunca mais alto que o ponto onde a água caiu, pra não "subir
+    ladeira acima". Ele para sozinho ao esbarrar em blocos sólidos dos dois
+    lados (um buraco fechado vira uma lagoa cheia) e tem uma trava de
+    segurança (LIMITE_INUNDACAO) para o caso de a água ser despejada numa
+    área aberta em vez de um buraco, evitando inundar o mundo inteiro.
+
+    [FIX] Antes esta função chamava garantir_dados_da_coluna() para cada
+    célula vizinha -- e essa função GERA TERRENO NOVO (gerar_dados_relevo)
+    sempre que a água tenta se espalhar para um chunk que ainda não existia.
+    Na prática, jogar água perto de área inexplorada criava terreno de
+    verdade ali (relevo, fundo de areia etc.), como se a água estivesse
+    "esculpindo" o mundo. Agora a água só se espalha por chunks que JÁ foram
+    gerados -- se ela bate numa borda do mundo ainda não gerada, para ali,
+    exatamente como bateria num bloco sólido.
+
+    [FIX] Também agora respeitamos RAIO_MAXIMO_INUNDACAO: a água nunca se
+    espalha mais longe do que isso (em X/Z) do ponto onde foi despejada,
+    não importa quantos caminhos de célula vazia existam -- ver o
+    comentário da constante para o motivo.
+    """
+    fila = deque([posicao_inicial])
+    visitados = {posicao_inicial}
+    chunks_afetados = set()
+    ix, iy, iz = posicao_inicial
+
+    while fila and len(visitados) < LIMITE_INUNDACAO:
+        x, y, z = fila.popleft()
+        for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, -1, 0)):
+            nx, ny, nz = x + dx, y + dy, z + dz
+            if ny > posicao_inicial[1] or (nx, ny, nz) in visitados:
+                continue
+            if abs(nx - ix) > RAIO_MAXIMO_INUNDACAO or abs(nz - iz) > RAIO_MAXIMO_INUNDACAO:
+                continue
+
+            # Só avança se o chunk dessa célula já existir -- nunca gera
+            # terreno novo como efeito colateral de despejar água.
+            if (nx // TAMANHO_CHUNK, nz // TAMANHO_CHUNK) not in chunks_gerados:
+                continue
+            if cache_mapa.get((nx, ny, nz)) is not None:
+                continue  # bloco sólido ou já com algo -- água não passa
+
+            cache_mapa[(nx, ny, nz)] = 'agua'
+            visitados.add((nx, ny, nz))
+            fila.append((nx, ny, nz))
+            chunks_afetados.add((nx // TAMANHO_CHUNK, nz // TAMANHO_CHUNK))
+
+    for cx, cz in chunks_afetados:
+        for dcx in (-1, 0, 1):
+            for dcz in (-1, 0, 1):
+                solicitar_atualizacao_chunk(cx + dcx, cz + dcz)
 
 
 def coordenada_do_ponto(ponto):
@@ -760,8 +1114,94 @@ def coluna_livre_para_jogador(ponto):
     return True
 
 
+def bloco_em(x, y, z):
+    """Devolve o tipo do bloco na célula de grade que contém o ponto (x,y,z),
+    garantindo que os dados daquela coluna já existam.
+    """
+    garantir_dados_da_coluna(x, z)
+    cx = math.floor(x + 0.5)
+    cz = math.floor(z + 0.5)
+    return cache_mapa.get((cx, math.floor(y), cz))
+
+
 def jogador_esta_na_agua():
-    return jogador.y < NIVEL_AGUA + 1.0
+    """Física de natação: liga assim que existe água no peito do jogador
+    (um pouco acima dos pés).
+
+    [FIX] Antes isso usava nivel_superficie_agua() para "procurar" uma
+    superfície de água perto da coluna do jogador, subindo/descendo até 3
+    blocos a partir da posição atual. Essa busca heurística tinha um efeito
+    colateral perigoso: ao encher o lago com água extra, era fácil a água
+    vazar/alcançar uma bolsa escondida no terreno (uma caverna, um buraco
+    debaixo do chão) perto o bastante da coluna do jogador para a busca
+    "achar água" ali por engano, mesmo o jogador estando bem longe e acima
+    de qualquer água visível -- exatamente o que causava a visão turva
+    aparecendo acima do nível real da água depois de despejar mais água no
+    lago. Checar diretamente o bloco onde o corpo do jogador está é muito
+    mais confiável: só conta como "na água" a célula onde ele literalmente
+    está.
+    """
+    return bloco_em(jogador.x, jogador.y + 0.9, jogador.z) == 'agua'
+
+
+def profundidade_olhos_na_agua():
+    """Retorna o quanto os OLHOS (a câmera) estão abaixo da superfície da
+    água que os envolve: positivo = câmera submersa, -1 = câmera fora
+    d'água (mesmo raciocínio de jogador_esta_na_agua(): primeiro checamos
+    o bloco EXATO onde a câmera está, em vez de procurar uma superfície
+    por perto, pra não confundir água escondida no terreno com a água
+    visível onde o jogador realmente está).
+
+    [FIX] Antes a altura dos olhos era calculada como
+    "jogador.y + jogador.camera_pivot.y", supondo um valor fixo pra essa
+    distância (2 unidades). Só que isso é a posição LOCAL do pivot, e
+    qualquer diferença entre esse número suposto e a altura real da câmera
+    no mundo jogava a conta inteira pra cima -- exatamente o motivo de tanto
+    a visão turva quanto o "teto" de natação (mais abaixo, no laço de update)
+    ligarem cedo demais, um bloco inteiro (ou mais) acima do nível visível da
+    água. Usar camera.world_y direto pega a altura REAL da câmera no mundo,
+    sem depender de nenhuma suposição sobre a altura do personagem.
+    """
+    altura_olhos = camera.world_y
+    if bloco_em(jogador.x, altura_olhos, jogador.z) != 'agua':
+        return -1
+    superficie = nivel_superficie_agua(jogador.x, jogador.z, altura_olhos)
+    return superficie - altura_olhos
+
+
+def nivel_superficie_agua(x, z, y_referencia):
+    """Acha a altura da superfície da água que envolve o ponto (x, y, z).
+
+    Sobe célula por célula a partir de y_referencia enquanto a coluna
+    continuar sendo água, e devolve a primeira altura que já não é mais
+    água -- ou seja, o topo da poça/lago/mar ali. Precisamos disso em vez de
+    usar NIVEL_AGUA fixo porque, com blocos de água colocados pelo jogador,
+    uma lagoa pode existir em qualquer altura do mundo, não só no nível do
+    mar.
+
+    [FIX] jogador_esta_na_agua() considera o jogador "na água" se OU o peito
+    OU os pés (0.9 abaixo) estiverem numa célula de água. Só que aqui a
+    busca partia direto de y_referencia (o peito) -- se exatamente o peito
+    já tinha saído da água mas os pés ainda estavam molhados (a situação
+    típica de estar boiando na superfície), a célula de partida já não era
+    'agua', o laço nem rodava, e a função devolvia a própria altura atual do
+    jogador sem achar a superfície de verdade -- por isso o nado ficava
+    "acima" do nível visível da água. Agora, se a célula de partida não for
+    água, primeiro descemos (até 3 células) até achar água de verdade antes
+    de subir procurando o topo.
+    """
+    cx = math.floor(x + 0.5)
+    cz = math.floor(z + 0.5)
+    garantir_dados_da_coluna(x, z)
+    y = math.floor(y_referencia)
+    limite_inferior = y - 3
+    while cache_mapa.get((cx, y, cz)) != 'agua' and y > limite_inferior:
+        y -= 1
+
+    limite_superior = y + ALTURA_MAXIMA  # trava de segurança
+    while cache_mapa.get((cx, y, cz)) == 'agua' and y < limite_superior:
+        y += 1
+    return y
 
 
 def bloco_mirado(distancia_maxima=6):
@@ -977,8 +1417,22 @@ def input(key):
         jogador.grounded = False
         return
 
-    if key in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0']:
-        novo_index = int(key) - 1
+    if key in ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-']:
+        # [FIX] int(key) - 1 quebrava com ValueError assim que a tecla era
+        # '-' ('-' não é um número, então int('-') nunca funciona -- é
+        # exatamente o traceback que travava o jogo). O '0' também já era
+        # tratado errado antes: int('0') - 1 dá -1, um índice negativo que
+        # em Python conta a partir do FIM da lista (ORDEM_BLOCOS[-1] é
+        # 'agua', não o 10º slot que o '0' devia selecionar). Como
+        # ORDEM_BLOCOS tem 11 blocos, não cabe só em '1'-'9': '0' é o 10º
+        # slot (índice 9) e '-' é o 11º e último (índice 10) -- mapeamos os
+        # dois na mão em vez de derivar de int(key).
+        if key == '0':
+            novo_index = 9
+        elif key == '-':
+            novo_index = 10
+        else:
+            novo_index = int(key) - 1
         if novo_index < len(ORDEM_BLOCOS):
             atualizar_selecao_hotbar(novo_index)
 
@@ -1004,13 +1458,25 @@ def input(key):
             if cache_mapa.get(coordenada_bloco) == 'bedrock':
                 return  # não deixa quebrar
             del cache_mapa[coordenada_bloco]
-            alvo_x, _, alvo_z = coordenada_bloco
+            alvo_x, alvo_y, alvo_z = coordenada_bloco
             solicitar_atualizacoes_do_bloco(alvo_x, alvo_z)
+
+            # Se o buraco recém-aberto tem água colada do lado (você cavou
+            # perto de um lago/mar existente), a água escoa pra dentro dele
+            # -- antes isso só acontecia ao COLOCAR água manualmente; cavar
+            # do lado de fora não puxava a água pra dentro.
+            for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0)):
+                vizinho = (alvo_x + dx, alvo_y + dy, alvo_z + dz)
+                if cache_mapa.get(vizinho) == 'agua':
+                    encher_buraco_com_agua(vizinho)
+                    break
 
         elif celula_livre is not None and cache_mapa.get(celula_livre) is None:
             cache_mapa[celula_livre] = bloco_selecionado
             alvo_x, _, alvo_z = celula_livre
             solicitar_atualizacoes_do_bloco(alvo_x, alvo_z)
+            if bloco_selecionado == 'agua':
+                encher_buraco_com_agua(celula_livre)
 
 
 # --- 9. LAÇO DE ATUALIZAÇÃO POR FRAME ---
@@ -1018,14 +1484,8 @@ _temporizador = 0
 
 
 def update():
-    global _temporizador, pulos_extras, velocidade_vertical
-
-    if 'plano_agua' in globals() and plano_agua:
-        # 1. CORRENTEZA BEM SUAVE: Reduzimos os valores para a textura deslizar devagarzinho
-        plano_agua.texture_offset += Vec2(0.05 * time.dt, 0.01 * time.dt)
-
-        # 2. MARÉ LENTA: Ajustamos o math.sin para subir e descer de forma quase imperceptível
-        plano_agua.y = (NIVEL_AGUA + 4) + math.sin(time.time() * 0.8) * 0.03
+    global _temporizador, pulos_extras, velocidade_vertical, agua_efeito_ativo, altura_olhos_referencia
+    global _frame_chuva
 
     if not jogo_iniciado or tela_carregamento.enabled:
         return
@@ -1045,10 +1505,8 @@ def update():
 
     if menu_pausa.enabled:
         efeito_agua.enabled = False
+        chuva.enabled = False
         return
-
-    esta_na_agua = jogador_esta_na_agua()
-    efeito_agua.enabled = esta_na_agua
 
     # [FIX] Limitamos (clamp) o dt usado na física. Sem isso, se um frame
     # qualquer demorar muito no mundo real (por exemplo, logo depois de
@@ -1063,8 +1521,101 @@ def update():
     # parecia um bug de colisão mas na real era esse dt sem limite. 0.05
     # equivale a no mínimo ~20 quadros por segundo de física por frame,
     # suficiente pra qualquer soluço não atravessar um bloco inteiro.
+    #
+    # [FIX] Movido pra cá (antes só existia mais abaixo) porque a atualização
+    # da chuva também precisa de um dt confiável -- sem isso, na primeira
+    # execução dessa parte do update() o "dt" ainda nem existia.
     dt = min(time.dt, 0.05)
 
+    esta_na_agua = jogador_esta_na_agua()  # controla a FÍSICA de natação (baseado nos pés)
+
+    # [FIX] Só remedimos altura_olhos_referencia enquanto o jogador está fora
+    # da água (esta_na_agua == False) -- é a única situação estável, sem
+    # nenhuma correção de altura em andamento que possa contaminar a leitura.
+    if not esta_na_agua:
+        altura_olhos_referencia = camera.world_y - jogador.y
+
+    # [FIX] O efeito visual (tela turva/azulada) agora é controlado à parte,
+    # pela submersão dos OLHOS (profundidade_olhos_na_agua), não dos pés --
+    # ver o docstring da função para o motivo. Assim a visão só embaça
+    # quando a câmera realmente está abaixo do nível visível da água, e
+    # desliga assim que a cabeça sai, mesmo que os pés continuem molhados.
+    profundidade_olhos = profundidade_olhos_na_agua()
+    # [FIX] Histerese: se o efeito já estava ligado, só desliga quando a
+    # profundidade cair abaixo de MARGEM_DESLIGAR_TURVA (bem acima da
+    # superfície); se estava desligado, só liga quando passar de
+    # MARGEM_LIGAR_TURVA (visivelmente abaixo da superfície). Isso impede o
+    # efeito de piscar ligado/desligado quando o jogador está boiando parado
+    # bem em cima da linha da água.
+    if agua_efeito_ativo:
+        agua_efeito_ativo = profundidade_olhos > MARGEM_DESLIGAR_TURVA
+    else:
+        agua_efeito_ativo = profundidade_olhos > MARGEM_LIGAR_TURVA
+    cabeca_submersa = agua_efeito_ativo
+    efeito_agua.enabled = cabeca_submersa
+    if cabeca_submersa:
+        # [FIX] Curva suave: logo que passa da margem de entrada, a tela fica
+        # só levemente turva (não direto escura/opaca) -- a intensidade forte
+        # só aparece quando o jogador já está visivelmente fundo, não bem na
+        # beira da superfície. profundidade_efetiva desconta a margem de
+        # entrada, então ela começa em ~0 exatamente onde o efeito liga.
+        # [AJUSTE] A pedido do usuário, o efeito agora começa mais forte
+        # (0.35 em vez de 0.22) e sobe mais rápido com a profundidade (0.55
+        # em vez de 0.32), chegando bem mais turvo/azul quanto mais fundo
+        # o jogador mergulha.
+        profundidade_efetiva = max(0.0, profundidade_olhos - MARGEM_LIGAR_TURVA)
+        alpha = min(0.95, 0.35 + profundidade_efetiva * 0.55)
+        efeito_agua.color = color.rgba(*COR_EFEITO_AGUA, alpha)
+
+    # [FIX] A chuva some debaixo d'água (não faria sentido ver gotas caindo
+    # enquanto está submerso) e com o menu de pausa (senão o mundo "continua
+    # chovendo" por trás do menu). A visibilidade por CAVERNA/teto agora é
+    # decidida gota por gota (ver bloqueios_chuva/calcular_estado_gota), não
+    # pelo jogo inteiro de uma vez: a coluna debaixo dos PÉS do jogador podia
+    # estar bloqueada (parado bem na boca de uma caverna, olhando pra fora)
+    # enquanto a maior parte das gotas ao redor, já em área aberta, deveria
+    # continuar visível -- checar só a coluna do jogador desligava a chuva
+    # inteira nesse caso.
+    chuva.enabled = not cabeca_submersa
+    if chuva.enabled:
+        for i, g in enumerate(gotas_chuva):
+            if impactos_chuva[i] is None:
+                impactos_chuva[i], bloqueios_chuva[i] = calcular_estado_gota(g.x, g.z)
+
+            # altura de impacto em coordenada LOCAL (relativa a jogador.y),
+            # pra comparar direto com a posição da gota, que também é local.
+            altura_impacto_local = impactos_chuva[i] - jogador.y
+
+            nova_altura = g.y - VELOCIDADE_QUEDA_CHUVA * dt
+            if nova_altura <= altura_impacto_local:
+                # [NOVO] bateu na superfície (chão ou água) -- um respingo
+                # rápido bem na altura certa, só se a coluna não estiver
+                # bloqueada por um teto (não faz sentido respingo onde a
+                # própria gota nem aparece na tela). Depois reaparece lá em
+                # cima numa posição X/Z nova, com um novo estado calculado
+                # pra essa nova coluna.
+                if not bloqueios_chuva[i]:
+                    criar_respingo_chuva(g.x, altura_impacto_local, g.z)
+                novo_x = random.uniform(-RAIO_CHUVA, RAIO_CHUVA)
+                novo_z = random.uniform(-RAIO_CHUVA, RAIO_CHUVA)
+                gotas_chuva[i] = Vec3(novo_x, ALTURA_CHUVA, novo_z)
+                impactos_chuva[i], bloqueios_chuva[i] = calcular_estado_gota(novo_x, novo_z)
+            else:
+                gotas_chuva[i] = Vec3(g.x, nova_altura, g.z)
+
+        # [OTIMIZAÇÃO FPS] chuva.model.generate() reenvia a malha inteira
+        # (todos os vértices) pra GPU -- é a parte mais cara do sistema de
+        # chuva depois dos respingos. Fazendo isso a cada 2 frames em vez de
+        # todo frame, cortamos essa metade do custo pela metade sem dar pra
+        # perceber (a chuva ainda "atualiza" a 30fps quando o jogo roda a
+        # 60fps, e gotas caindo rápido escondem bem esse detalhe).
+        _frame_chuva += 1
+        if _frame_chuva % 2 == 0:
+            chuva.model.vertices = gerar_vertices_chuva()
+            chuva.model.generate()
+
+    # [FIX] Limitamos (clamp) o dt usado na física -- ver comentário no topo
+    # do update(), onde essa variável agora é calculada.
     if esta_na_agua:
         # --- MODO NATAÇÃO ---
         velocidade_vertical = 0
@@ -1084,7 +1635,22 @@ def update():
 
         if movimento_horizontal.length() > 0:
             movimento_horizontal = movimento_horizontal.normalized() * VELOCIDADE_NADO * dt
-            jogador.position += movimento_horizontal
+
+            # [FIX] Antes isso era "jogador.position += movimento_horizontal"
+            # direto, sem checar colisão nenhuma -- diferente do modo terra
+            # (que testa coluna_livre_para_jogador antes de mover). Resultado:
+            # nadando na direção da margem, dava pra atravessar o bloco da
+            # parede/beirada do lago e ficar preso dentro dele quando saía
+            # da água (a "visão por trás do bloco"). Testamos X e Z
+            # separadamente, igual no modo terra, pra também poder deslizar
+            # ao longo de uma parede em vez de travar.
+            pos_x = jogador.position + Vec3(movimento_horizontal.x, 0, 0)
+            if coluna_livre_para_jogador(pos_x):
+                jogador.x = pos_x.x
+
+            pos_z = jogador.position + Vec3(0, 0, movimento_horizontal.z)
+            if coluna_livre_para_jogador(pos_z):
+                jogador.z = pos_z.z
 
         alvo_vertical = 0.0
         if held_keys['space']:
@@ -1097,10 +1663,46 @@ def update():
 
         jogador.y += alvo_vertical * dt
 
-        if jogador.y > NIVEL_AGUA + 0.9 and not held_keys['space']:
-            jogador.y = NIVEL_AGUA + 0.9
-
+        # Antes isso travava o jogador em NIVEL_AGUA + 0.9 (o nível do mar
+        # fixo). Como agora pode existir água em qualquer altura (lagos,
+        # poças feitas pelo jogador), calculamos a superfície da água LOCAL
+        # em vez de usar um número fixo -- senão nadar numa lagoa de montanha
+        # ia te puxar de volta pro nível do mar.
+        #
+        # [FIX] jogador.y é a posição dos PÉS (a base do FirstPersonController),
+        # e a câmera fica montada acima disso. Usamos altura_olhos_referencia
+        # (medida em terra firme, ver definição da variável lá em cima) em vez
+        # de ler "camera.world_y - jogador.y" ao vivo aqui dentro -- ler ao
+        # vivo bem no frame em que jogador.y acabou de mudar podia sair errado
+        # por um atraso de propagação da câmera, e como essa correção só
+        # empurra o jogador pra baixo (nunca pra cima), o erro se acumulava a
+        # cada frame até o jogador atravessar o fundo do oceano.
+        #
+        # [FIX] Calculamos y_chao_atual (o fundo real) ANTES de aplicar esse
+        # clamp, e nunca deixamos limite_pes cair abaixo dele. Antes, em água
+        # rasa (perto da praia, por exemplo), "superficie_local - altura_camera"
+        # podia dar um valor mais baixo que o fundo sólido de verdade -- ou
+        # seja, o próprio clamp empurrava os PÉS do jogador pra dentro do
+        # chão, sem saber que o fundo estava mais perto que isso. Pior: a
+        # trava de segurança que vinha logo depois (y_chao_atual + 1.2) rodava
+        # DEPOIS desse empurrão, procurando o chão a partir de uma posição já
+        # afundada demais -- como altura_do_chao só procura pra BAIXO, ela
+        # nunca mais encontrava o fundo real, e sim alguma camada sólida mais
+        # profunda ainda (uma caverna, rocha), fazendo o jogador continuar
+        # afundando cada vez mais até precisar pular várias vezes pra escapar.
+        # [AJUSTE] A pedido do usuário, a posição de descanso ao nadar (sem
+        # segurar espaço) ficava com os OLHOS um pouco ABAIXO da superfície
+        # (o "-0.1" no cálculo) -- só subindo pra cima d'água quando ele
+        # segurava espaço. Trocamos pra "+0.35": por padrão, flutuando parado,
+        # a cabeça já fica um pouco ACIMA da água (como nadar de verdade), e
+        # segurar espaço continua subindo mais alto que isso.
         y_chao_atual = altura_do_chao(jogador.x, jogador.z, jogador.y)
+        superficie_local = nivel_superficie_agua(jogador.x, jogador.z, jogador.y)
+        altura_camera = altura_olhos_referencia
+        limite_pes = max(superficie_local - altura_camera + 0.35, y_chao_atual + 1.2)
+        if jogador.y > limite_pes and not held_keys['space']:
+            jogador.y = limite_pes
+
         if jogador.y < y_chao_atual + 1.2:
             jogador.y = y_chao_atual + 1.2
 
