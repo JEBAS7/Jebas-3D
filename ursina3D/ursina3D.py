@@ -1,6 +1,6 @@
 from ursina import *
 from ursina.prefabs.first_person_controller import FirstPersonController
-from panda3d.core import TransparencyAttrib
+from panda3d.core import TransparencyAttrib, Fog
 import math
 import os
 import json
@@ -1284,13 +1284,51 @@ fundo_opcoes = Entity(parent=menu_opcoes, model='quad', scale=(2, 2), color=colo
 titulo_opcoes = Text(parent=menu_opcoes, text='OPÇÕES DE VÍDEO', scale=2.5, position=(-0.25, 0.4), color=color.white)
 
 
+# --- NEBLINA DE DISTÂNCIA ---
+# [NOVO] O motivo de "2 Chunks" parecer um mundinho quebrado não é o mundo em
+# si -- ele continua sendo gerado sem limites conforme o jogador anda (veja
+# gerenciar_chunks_visiveis, que sempre carrega ao REDOR da posição atual,
+# não uma área fixa). O problema é que, sem neblina, o limite onde os chunks
+# carregados terminam é um corte seco: do lado de dentro, chão e árvores; do
+# lado de fora, nada -- ar vazio até o céu. Com DISTANCIA_VISAO=2 esse corte
+# fica bem perto do jogador e salta aos olhos; com 6 ele só fica mais longe,
+# mas o problema é o mesmo.
+#
+# A neblina resolve isso escurecendo/clareando gradualmente tudo que já está
+# perto dessa borda até a cor do céu -- então o jogador nunca chega a ver o
+# corte, só um horizonte que se perde de vista, como um mundo de verdade.
+# Isso não desenha NADA a mais (não custa FPS): só recolore pixels que já
+# seriam desenhados de qualquer forma. É por isso que dá pra ter qualquer
+# DISTANCIA_VISAO, mesmo curta, sem parecer um mapa pequeno.
+_COR_NEBLINA = (0.72, 0.78, 0.83)  # tom acinzentado/azulado -- combina com o horizonte do Sky() padrão do Ursina
+_neblina_mundo = Fog('neblina_mundo')
+_neblina_mundo.setColor(*_COR_NEBLINA)
+scene.setFog(_neblina_mundo)
+
+
+def atualizar_neblina():
+    """Recalcula o alcance da neblina a partir de DISTANCIA_VISAO, pra que
+    ela sempre comece um pouco antes da borda dos chunks carregados e já
+    esteja totalmente opaca bem em cima dela -- não importa a distância de
+    visão escolhida, o limite do mundo carregado nunca fica visível.
+    """
+    alcance = DISTANCIA_VISAO * TAMANHO_CHUNK
+    inicio = max(6, alcance * 0.55)
+    fim = max(inicio + 4, alcance * 0.95)
+    _neblina_mundo.setLinearRange(inicio, fim)
+
+
 def mudar_distancia_visao(valor):
     global DISTANCIA_VISAO
     DISTANCIA_VISAO = valor
     texto_distancia.text = f'Distancia de Visao: {DISTANCIA_VISAO} Chunks'
+    atualizar_neblina()
     if jogo_iniciado:
         resetar_entidades_mundo()
         gerenciar_chunks_visiveis()
+
+
+atualizar_neblina()
 
 
 def configurar_modo_tela(modo):
@@ -1764,6 +1802,11 @@ def update():
 
 # --- 10. INICIALIZAÇÃO DO JOGO ---
 ceu = Sky()
+# [NOVO] Tingir o céu com a mesma cor da neblina (_COR_NEBLINA) -- sem isso,
+# dava pra ver onde a neblina "termina" e o céu original começa, uma linha
+# ou faixa de cor diferente bem no horizonte. Com a mesma cor dos dois lados,
+# neblina e céu se misturam sem costura.
+ceu.color = color.rgba(*_COR_NEBLINA, 1)
 sol = DirectionalLight()
 sol.look_at(Vec3(1, -1, 1))
 
