@@ -10,6 +10,17 @@ from collections import deque
 app = Ursina()
 window.fps_counter.enabled = True
 
+# [FIX] Por padrão o Ursina carrega texturas com Texture.default_filtering =
+# None -- ou seja, sem mipmap e sem filtro nenhum (sampling "ponto a ponto").
+# Isso é ótimo pra pixel art de propósito, mas em texturas realistas/
+# fotográficas (grama, terra, pedra) faz o padrão da textura "tremular"/
+# virar ruído granulado a qualquer distância -- exatamente o efeito de
+# estática visível na grama e na areia do mundo. 'mipmap' gera as versões
+# reduzidas da textura e o motor escolhe a mais adequada pela distância,
+# suavizando esse ruído sem borrar de perto. Precisa ser definido ANTES de
+# qualquer textura ser carregada (chunks, hotbar, mão do jogador etc.).
+Texture.default_filtering = 'mipmap'
+
 # --- 0. TENTA CARREGAR A MÚSICA NATIVAMENTE ---
 try:
     musica_fundo = Audio('ex021.mp3', loop=True, autoplay=True, volume=0.5)
@@ -131,6 +142,29 @@ jogador.gravity = 0
 jogador.speed = 0
 jogador.jump_height = 0
 
+# [FIX] Entity "seguidora" usada como pai da chuva e dos respingos, em vez de
+# usar "jogador" diretamente. jogador (FirstPersonController) GIRA no eixo Y
+# toda vez que o jogador olha para os lados com o mouse -- mas
+# calcular_estado_gota() calcula a altura de impacto tratando offset_x/
+# offset_z como um deslocamento FIXO no mundo (wx = jogador.x + offset_x,
+# sem nenhuma rotação). Como a chuva/respingos eram filhos de "jogador" (que
+# roda), esse mesmo offset era rotacionado automaticamente na hora de
+# desenhar -- ou seja, a altura de impacto era calculada para um ponto X/Z e
+# o respingo aparecia desenhado em OUTRO ponto X/Z (o offset rotacionado),
+# quase sempre com uma altura de terreno bem diferente da calculada. Como a
+# rotação em Y não muda a altura (eixo Y fica intacto), o respingo ficava
+# "preso" na altura errada -- na prática quase sempre abaixo do relevo real
+# daquele ponto, ou seja, debaixo do chão, invisível. Isso explica o
+# contador "respingos/seg" mostrando valores normais (a lógica de disparo
+# está certa) enquanto nenhum respingo aparece na tela (só o posicionamento
+# visual estava errado).
+#
+# seguidor_chuva copia só a POSIÇÃO de jogador a cada frame (ver update()),
+# nunca a rotação -- assim o offset X/Z usado pra desenhar a chuva/respingos
+# é sempre o mesmo eixo "mundo" usado em calcular_estado_gota, não importa
+# pra onde o jogador esteja olhando.
+seguidor_chuva = Entity(position=jogador.position)
+
 pulos_extras = 2
 velocidade_vertical = 0.0
 # [FIX] Estado persistente do efeito de água turva entre frames -- necessário
@@ -176,11 +210,21 @@ efeito_agua = Entity(parent=camera.ui, model='quad', scale=2,
 # de objetos separados todo frame, pesado), tudo vira um ÚNICO Mesh -- um
 # desenho só, resolvendo tudo de uma vez.
 #
-# O container fica com parent=jogador (não parent=camera!): assim ele anda
-# junto com o jogador automaticamente, e como jogador só gira no eixo Y
-# (olhar pra cima/baixo é só a câmera dentro dele), as gotas continuam
-# sempre verticais na tela, nunca inclinadas. Se fosse parent=camera, olhar
-# pra cima ou pra baixo inclinaria a chuva inteira junto com a câmera.
+# [FIX] O container fica com parent=seguidor_chuva (não parent=camera nem
+# parent=jogador!). seguidor_chuva é uma Entity separada que só copia a
+# POSIÇÃO de jogador a cada frame (ver update()), nunca a rotação. Usar
+# parent=jogador direto parecia funcionar (jogador também só gira no eixo Y,
+# então as gotas continuam verticais do mesmo jeito), mas isso rotacionava
+# junto o offset X/Z de cada gota/respingo -- e calcular_estado_gota() soma
+# esse mesmo offset a jogador.x/z como se fosse um deslocamento FIXO no
+# mundo, sem nenhuma rotação. O resultado: a altura de impacto calculada
+# valia para um ponto X/Z, mas a gota/respingo era desenhado rotacionado
+# para OUTRO ponto X/Z -- quase sempre com uma altura de terreno diferente,
+# fazendo os respingos ficarem "presos" na altura errada (na prática, quase
+# sempre abaixo do relevo real, ou seja, debaixo do chão, invisíveis). Com
+# seguidor_chuva (posição sem rotação), o eixo usado pra desenhar é sempre o
+# mesmo eixo "mundo" usado no cálculo de altura -- e como parent=camera
+# continua fora de cogitação, olhar pra cima/baixo não inclina a chuva.
 # [OTIMIZAÇÃO FPS] Reduzido de 220 -- cada gota vira 8 vértices no mesh e,
 # mais importante, cada gota que bate no chão dispara um respingo. Com 220
 # gotas o jogo criava e destruía uma Entity de respingo ~150-200 vezes por
@@ -193,6 +237,23 @@ ALTURA_CHUVA = 16          # começam a essa altura acima do jogador, e reaparec
 VELOCIDADE_QUEDA_CHUVA = 26
 COMPRIMENTO_GOTA = 0.6
 LARGURA_GOTA = 0.035
+
+# [NOVO] Vento: sem isso a chuva cai perfeitamente na vertical, o que lê como
+# artificial (chuva de verdade quase sempre cai em diagonal, empurrada pelo
+# vento). Isso só inclina o TRAÇO desenhado de cada gota (ver
+# gerar_vertices_chuva) -- não move a posição X/Z da gota nem a lógica de
+# impacto/colisão, então o resto do sistema (recalcular_estado_gota etc.)
+# continua funcionando exatamente igual.
+VENTO_CHUVA = Vec3(0.35, 0, 0.15)
+
+# [NOVO] Texturas opcionais pro visual da chuva (traço da gota caindo e anel
+# de respingo no impacto) -- a pedido do usuário, pra ficar menos "quadrado
+# sólido" e mais parecido com uma gota/respingo de verdade, com bordas
+# suaves e semi-transparentes em vez de um retângulo de cor chapada. Se os
+# arquivos não existirem (pasta texturas/ sem eles), cai de volta pro
+# retângulo colorido simples que já funcionava antes -- nada quebra.
+TEXTURA_GOTA_CHUVA = 'texturas/gota_chuva.png' if os.path.exists('texturas/gota_chuva.png') else None
+TEXTURA_RESPINGO = 'texturas/respingo.png' if os.path.exists('texturas/respingo.png') else None
 
 gotas_chuva = [
     Vec3(random.uniform(-RAIO_CHUVA, RAIO_CHUVA),
@@ -208,6 +269,17 @@ gotas_chuva = [
 # mais abaixo no arquivo -- o valor real de cada uma é preenchido na
 # primeira vez que o update() processa aquela gota (ver calcular_estado_gota).
 impactos_chuva = [None] * NUM_GOTAS_CHUVA
+
+# [FIX] Guarda a coluna de mundo (int(wx), int(wz)) usada da ÚLTIMA vez que
+# a altura de impacto de cada gota foi calculada. Antes, impactos_chuva[i]
+# só era (re)calculado quando a gota nascia -- mas a posição da gota é
+# relativa ao JOGADOR, então enquanto ele anda, a coluna de mundo que essa
+# gota representa muda (um morro, uma duna, a beira d'água...) e a altura
+# de impacto guardada ficava desatualizada. A gota continuava caindo até
+# essa altura "velha", que já não batia com o relevo real ali embaixo --
+# daí os respingos aparecendo flutuando no ar. Agora comparamos a coluna
+# atual com a última usada e recalculamos sempre que ela mudar.
+colunas_impacto_chuva = [None] * NUM_GOTAS_CHUVA
 
 # [FIX] Se cada gota está bloqueada ou não (True = tem teto sólido acima
 # dessa coluna especificamente, então a gota não deve aparecer). Antes a
@@ -234,20 +306,86 @@ def calcular_estado_gota(offset_x, offset_z):
     coluna (topo_solido_coluna, que já ignora água), ou o topo da água, o
     que for mais alto ali.
 
-    bloqueada é True quando o relevo real dessa coluna está bem ACIMA de
-    onde a chuva nasce perto do jogador (jogador.y + ALTURA_CHUVA) -- sinal
-    de que existe uma camada de pedra sólida de verdade entre a região onde
-    a chuva cai perto do jogador e o céu ali (uma caverna/teto), não só uma
-    ladeira ou diferença comum de relevo (que fica dentro desse alcance).
-    Sem esse limite, uma gota tentaria cair até um "chão" que já está ACIMA
-    de onde ela nasce e nunca chegaria lá (nunca reapareceria).
+    [FIX] A versão anterior decidia "bloqueada" só pela DISTÂNCIA entre o
+    topo dessa coluna e o jogador: só bloqueava quando o topo estava mais de
+    ALTURA_CHUVA (16) acima do jogador. Isso quebrava em CAVERNAS RASAS --
+    com o teto de pedra só uns poucos blocos acima da cabeça do jogador, a
+    distância ficava dentro do limite de "relevo comum" e a chuva era
+    tratada como se estivesse em céu aberto, caindo até a altura do chão de
+    FORA da caverna. Como esse chão de fora fica bem acima de onde o
+    jogador realmente está (dentro da caverna), o respingo aparecia
+    flutuando no ar / dentro da própria rocha, em vez de sumir -- exatamente
+    o bug relatado (pingos e respingos em quadrado, soltos no ar, longe do
+    solo visível).
+
+    O problema de fundo é que "distância até o topo" não distingue uma
+    LADEIRA normal (terreno sólido contínuo, sem vão nenhum, até onde o
+    jogador está) de um TETO DE CAVERNA de verdade (um bloco sólido com um
+    vão de AR logo abaixo dele, onde mora o jogador) -- as duas podem ter a
+    mesma distância. Agora, em vez de comparar distâncias, checamos se
+    existe de fato um vão de ar entre o topo dessa coluna e a altura do
+    jogador: se o caminho for todo sólido (uma ladeira/monte de verdade),
+    não bloqueia; se houver qualquer ar no meio (um teto de verdade sobre um
+    espaço vazio), bloqueia -- não importa se isso está a 3 ou a 30 blocos
+    de distância.
     """
     wx = jogador.x + offset_x
     wz = jogador.z + offset_z
+    garantir_dados_da_coluna(wx, wz)
+
     topo = topo_solido_coluna(wx, wz)
-    agua = nivel_superficie_agua(wx, wz, jogador.y)
+    # [FIX] nivel_superficie_agua() foi feita pra checar água BEM PERTO de
+    # onde o jogador está (usa a altura dele como ponto de partida da busca)
+    # -- funciona bem pra natação, onde a coluna checada é sempre a do
+    # próprio jogador. Aqui a coluna é a da GOTA, que pode estar longe (até
+    # RAIO_CHUVA blocos de distância). Passar jogador.y como referência
+    # nessa coluna alheia é o bug: se não há água ali, a função ainda
+    # devolve um valor de "chão" baseado na altura do JOGADOR (não da
+    # coluna real) -- e se o jogador está numa colina alta olhando pra um
+    # vale baixo sem água, esse valor fantasma fica mais alto que o chão
+    # verdadeiro do vale, fazendo o respingo parar no ar. Usando topo + 1
+    # (o primeiro bloco logo acima do relevo sólido DESSA coluna) como
+    # referência, a busca por água fica ancorada no lugar certo: se houver
+    # água ali, ela começa bem em cima do chão dela e encontra a superfície
+    # certa; se não houver, a função devolve algo abaixo do chão e o max()
+    # abaixo escolhe topo + 1 (o relevo real) de qualquer forma.
+    agua = nivel_superficie_agua(wx, wz, topo + 1)
     impacto = max(topo + 1, agua)
-    bloqueada = (topo - jogador.y) > ALTURA_CHUVA
+
+    # [FIX] A varredura detalhada de "vão de ar" abaixo (pra achar teto de
+    # caverna de verdade) precisa descer da coluna até a altura do jogador
+    # -- e isso é caro E impreciso quando aplicado a QUALQUER uma das 150
+    # colunas de chuva, espalhadas num raio de RAIO_CHUVA (18) blocos.
+    # Terreno comum, sem caverna nenhuma na superfície, quase sempre tem
+    # alguma caverna ENTERRADA bem mais embaixo, sem relação nenhuma com o
+    # relevo visível ali -- e como a varredura desce fundo (até a altura do
+    # jogador), ela encontra esses vazios "por acaso" em várias colunas
+    # completamente abertas e as marca como bloqueadas por engano. Era por
+    # isso que só umas poucas gotas respingavam: quase todas estavam sendo
+    # descartadas por causa de cavernas escondidas, longe dali, sem nada a
+    # ver com o que aparece na tela.
+    #
+    # A checagem detalhada só faz sentido de verdade pertinho do jogador
+    # (ele mesmo debaixo de uma pedra baixa, tipo a boca de uma caverna).
+    # Pra gotas mais longe, voltamos à regra simples e barata (só bloquear
+    # se o relevo estiver muito mais alto que o jogador) -- longe o
+    # suficiente pra nunca cruzar cavernas que não tem nada a ver com o
+    # ponto onde a gota realmente cai.
+    DISTANCIA_TETO_DETALHADO = 4
+    bloqueada = False
+    if topo > jogador.y:
+        perto_do_jogador = offset_x * offset_x + offset_z * offset_z <= DISTANCIA_TETO_DETALHADO * DISTANCIA_TETO_DETALHADO
+        if perto_do_jogador:
+            inicio = min(ALTURA_MAXIMA - 1, topo - 1)
+            fim = max(-ALTURA_MAXIMA, math.floor(jogador.y))
+            for y in range(inicio, fim - 1, -1):
+                tipo = cache_mapa.get((int(wx), y, int(wz)))
+                if tipo is None:
+                    bloqueada = True
+                    break
+        else:
+            bloqueada = topo - jogador.y > ALTURA_CHUVA
+
     return impacto, bloqueada
 
 
@@ -260,31 +398,141 @@ def calcular_estado_gota(offset_x, offset_z):
 # ficamos girando entre elas (round-robin), só reposicionando e reanimando
 # a que estiver "livre" (a mais antiga). Zero criação/destruição em tempo
 # de jogo -- é praticamente de graça pra CPU.
-NUM_RESPINGOS_POOL = 40
+def gerar_mesh_anel_respingo(segmentos=14, raio_interno=0.35, raio_externo=1.0):
+    """Gera um anel (like um "O" achatado) em vez de um quadrado liso -- um
+    respingo de chuva de verdade lembra uma ondulação circular, não um
+    retângulo sólido. Sem textura de respingo disponível, desenhamos a
+    forma diretamente como geometria: um leque de triângulos entre um
+    círculo interno e um externo, com COR POR VÉRTICE (suportada pelo Mesh
+    do Ursina) esmaecendo a borda externa pra transparente e mantendo a
+    interna mais visível -- dá o efeito de "anel que desaparece pra fora"
+    sem precisar de nenhum arquivo de imagem.
+    """
+    vertices = []
+    triangles = []
+    cores = []
+    cor_interna = color.rgba(1, 1, 1, 1)
+    cor_externa = color.rgba(1, 1, 1, 0)
+    for i in range(segmentos):
+        a0 = (i / segmentos) * math.tau
+        a1 = ((i + 1) / segmentos) * math.tau
+        base = len(vertices)
+        vertices.extend([
+            Vec3(math.cos(a0) * raio_interno, math.sin(a0) * raio_interno, 0),
+            Vec3(math.cos(a0) * raio_externo, math.sin(a0) * raio_externo, 0),
+            Vec3(math.cos(a1) * raio_externo, math.sin(a1) * raio_externo, 0),
+            Vec3(math.cos(a1) * raio_interno, math.sin(a1) * raio_interno, 0),
+        ])
+        cores.extend([cor_interna, cor_externa, cor_externa, cor_interna])
+        triangles.extend([base, base + 1, base + 2, base, base + 2, base + 3])
+    return Mesh(vertices=vertices, triangles=triangles, colors=cores, mode='triangle', static=True)
+
+
+# Malha do anel gerada uma vez só e reaproveitada por TODAS as Entities do
+# pool -- é só geometria (sem posição própria), então compartilhar o mesmo
+# objeto Mesh entre várias Entities é seguro e economiza memória.
+_mesh_respingo = gerar_mesh_anel_respingo()
+
+# [FIX] Pool pequeno demais causava respingos "piscando"/desaparecendo cedo
+# demais em QUALQUER superfície (pedra, areia, grama e água), mesmo já
+# corrigida a posição e a ordem de desenho -- por isso ainda só "poucos
+# respingos" apareciam. Com NUM_GOTAS_CHUVA=150 caindo e cada uma batendo
+# no chão a cada ~1.2s (o tempo de queda inteiro, de ALTURA_CHUVA até o
+# impacto), a taxa de criação de respingos fica em torno de 120-180/seg (o
+# contador confirma isso). Só que cada respingo fica vivo (crescendo/
+# sumindo) por 0.35s (ver invoke(..., delay=0.35) em criar_respingo_chuva).
+# Com só 40 Entities no pool, cada uma era reaproveitada a cada
+# 40 / 150-180 ≈ 0.22-0.27s -- MAIS RÁPIDO que o próprio tempo de vida do
+# respingo anterior (0.35s). Ou seja, o "invoke" agendado pra apagar o
+# respingo (setattr enabled=False) da vez ANTERIOR ainda estava pendente
+# quando a MESMA Entity já tinha sido reaproveitada 1 ou até 2 vezes -- esse
+# invoke antigo disparava e apagava o respingo ATUAL no meio da própria
+# animação dele, bem antes dos 0.35s completarem. Isso acontecia com quase
+# TODOS os respingos, minando praticamente toda a duração visível de cada
+# um -- só uns poucos "escapavam" ilesos por sorte de timing, exatamente o
+# "poucos respingos aparecem" relatado, em qualquer tipo de superfície.
+#
+# A correção é dimensionar o pool para o PIOR CASO possível: como nenhuma
+# gota individual pode gerar um novo respingo antes de completar outro ciclo
+# de queda inteiro (~1.2s, bem mais que os 0.35s de vida do respingo), o
+# número de respingos "vivos" ao mesmo tempo nunca pode passar do número
+# total de gotas de chuva que existem -- NUM_GOTAS_CHUVA. Usando o mesmo
+# valor aqui, fica matematicamente impossível esse "reaproveitamento cedo
+# demais" acontecer de novo, não importa o quão rápido os respingos sejam
+# criados.
+NUM_RESPINGOS_POOL = NUM_GOTAS_CHUVA
 _pool_respingos = [
-    Entity(parent=jogador, model='quad', rotation_x=90, scale=0.06,
+    Entity(parent=seguidor_chuva, model=_mesh_respingo, rotation_x=90, scale=0.06,
            unlit=True, double_sided=True, enabled=False,
+           texture=TEXTURA_RESPINGO,
            color=color.rgba(225 / 255, 240 / 255, 255 / 255, 0))
     for _ in range(NUM_RESPINGOS_POOL)
 ]
+
+# [FIX] Respingo na ÁGUA some mesmo sendo criado (contador normal, nada
+# visível): a face de cima do bloco de água só é desenhada bem na altura
+# exata da superfície (ver atualizar_malha_chunk, a condição "vizinho is
+# None" pro topo da água) -- exatamente a MESMA altura que o respingo usa
+# pra se posicionar (altura_impacto_local). Ou seja, o anel do respingo e o
+# quadrado da superfície da água ficam perfeitamente COINCIDENTES no
+# espaço (mesmo plano). Os dois são transparentes (água com alpha 0.68,
+# respingo com alpha < 1), e o Panda3D decide a ordem de desenho de objetos
+# transparentes por DISTÂNCIA até a câmera -- com dois objetos exatamente
+# coincidentes, essa distância é praticamente igual, e o resultado é
+# instável: na maioria das vezes a água acaba sendo desenhada por cima do
+# respingo (ou os dois brigando/cintilando), escondendo-o -- pior ainda
+# visto de BAIXO d'água (o respingo fica "atrás" da face de baixo da
+# mesma água pro olho da câmera). Isso não acontece em cima da grama/terra
+# porque o bloco sólido é OPACO (o depth-test normal já resolve certo);
+# só afeta o caso ÁGUA-contra-ÁGUA (duas superfícies transparentes juntas).
+#
+# A correção: tirar o respingo do bin "transparent" (ordenado por
+# distância, ambíguo aqui) e colocá-lo no bin "fixed", que o Panda sempre
+# desenha DEPOIS de tudo que está no bin "transparent" -- ou seja, o anel
+# do respingo passa a ficar garantidamente por CIMA da superfície da água
+# (visualmente à frente dela), não importa se a câmera está acima ou
+# abaixo da linha d'água. O teste de profundidade (depth test) continua
+# ligado, então o respingo ainda fica escondido atrás de um bloco sólido
+# de verdade na frente dele -- só a ambiguidade entre duas superfícies
+# transparentes coincidentes é resolvida.
+for _respingo_pool_item in _pool_respingos:
+    _respingo_pool_item.setBin('fixed', 10)
+
 _indice_pool_respingos = 0
+
+# [DIAGNÓSTICO TEMPORÁRIO] Contador de respingos criados por segundo, exibido
+# na tela. Serve só pra descobrir SE o código está de fato chamando
+# criar_respingo_chuva() com frequência (bug de lógica, se o número for
+# baixo) ou se ele está sendo chamado normalmente mas o anel não aparece
+# direito (bug visual, se o número for alto mesmo com poucos respingos
+# visíveis). Pode ser removido depois que descobrirmos qual é o caso -- é só
+# procurar por "DIAGNÓSTICO TEMPORÁRIO" no arquivo pra tirar tudo.
+_contador_respingos_criados = 0
+_texto_debug_respingos = Text(
+    text='respingos/seg: --', position=window.top_left + Vec2(0.01, -0.01),
+    scale=1.2, color=color.yellow, background=True,
+)
 
 
 def criar_respingo_chuva(offset_x, altura_local, offset_z):
     """Um respingo rápido (cresce e some) no ponto de impacto de uma gota.
     Reaproveita uma Entity do pool em vez de criar/destruir uma nova.
     """
-    global _indice_pool_respingos
+    global _indice_pool_respingos, _contador_respingos_criados
+    _contador_respingos_criados += 1  # [DIAGNÓSTICO TEMPORÁRIO]
     respingo = _pool_respingos[_indice_pool_respingos]
     _indice_pool_respingos = (_indice_pool_respingos + 1) % NUM_RESPINGOS_POOL
 
     respingo.position = Vec3(offset_x, altura_local, offset_z)
-    respingo.scale = 0.06
+    respingo.scale = 0.05
     respingo.color = color.rgba(225 / 255, 240 / 255, 255 / 255, 0.65)
     respingo.enabled = True
-    respingo.animate_scale(0.3, duration=0.15, curve=curve.out_expo)
-    respingo.animate_color(color.rgba(225 / 255, 240 / 255, 255 / 255, 0), duration=0.25)
-    invoke(setattr, respingo, 'enabled', False, delay=0.3)
+    # [AJUSTE] Como o modelo agora é um ANEL (ver gerar_mesh_anel_respingo),
+    # crescer mais (0.05 -> 0.45, era só até 0.3) faz a ondulação se espalhar
+    # de forma visível, como uma respingo de verdade se abrindo na água/chão.
+    respingo.animate_scale(0.45, duration=0.2, curve=curve.out_expo)
+    respingo.animate_color(color.rgba(225 / 255, 240 / 255, 255 / 255, 0), duration=0.3)
+    invoke(setattr, respingo, 'enabled', False, delay=0.35)
 
 
 def gerar_vertices_chuva():
@@ -305,7 +553,7 @@ def gerar_vertices_chuva():
         if bloqueios_chuva[i]:
             vertices.extend([g] * 8)
             continue
-        base = g + Vec3(0, -COMPRIMENTO_GOTA, 0)
+        base = g + Vec3(-VENTO_CHUVA.x * COMPRIMENTO_GOTA, -COMPRIMENTO_GOTA, -VENTO_CHUVA.z * COMPRIMENTO_GOTA)
         # retângulo alinhado ao eixo X
         vertices.extend([
             g + Vec3(-LARGURA_GOTA, 0, 0),
@@ -337,10 +585,26 @@ def gerar_triangulos_chuva():
 
 _triangulos_chuva = gerar_triangulos_chuva()  # topologia fixa -- gerada uma vez só
 
-chuva = Entity(parent=jogador,
+
+# [FIX] Existia um "y=2" aqui nesta Entity -- um deslocamento extra pra CIMA
+# de 2 unidades, por cima de tudo que gerar_vertices_chuva() já calcula.
+# Os vértices de cada gota já são gerados em coordenada LOCAL relativa ao
+# jogador (impactos_chuva[i] - jogador.y, ver gerar_vertices_chuva /
+# calcular_estado_gota) -- ou seja, já pressupõem que a origem local (0) é
+# exatamente a altura do jogador. Com essa Entity deslocada +2 em cima
+# disso, a altura de exibição de CADA gota (e de onde ela "reseta" ao
+# bater) ficava 2 unidades ACIMA do impacto real calculado -- em qualquer
+# lugar do mapa, caverna ou não. Era por isso que a chuva continuava
+# aparecendo flutuando/em quadradinhos soltos no ar mesmo depois do fix da
+# caverna: aquele fix corrigia QUAL coluna deveria mostrar chuva, mas essa
+# entity ainda desenhava a gota 2 blocos mais alto que a altura de impacto
+# calculada, não importa a coluna. Removendo o "y=2" (ou seja, deixando a
+# Entity na mesma origem do jogador, y=0), a altura dos vértices volta a
+# corresponder exatamente à altura de impacto real.
+chuva = Entity(parent=seguidor_chuva,
                model=Mesh(vertices=gerar_vertices_chuva(), triangles=_triangulos_chuva, mode='triangle'),
                color=color.rgba(190 / 255, 210 / 255, 255 / 255, 0.55),
-               unlit=True, double_sided=True, y=2)
+               unlit=True, double_sided=True)
 
 # --- CRIAÇÃO DA HOTBAR VISUAL ---
 hotbar_conteiner = Entity(parent=camera.ui, enabled=False)
@@ -1519,14 +1783,31 @@ def input(key):
 
 # --- 9. LAÇO DE ATUALIZAÇÃO POR FRAME ---
 _temporizador = 0
+_temporizador_debug_respingos = 0  # [DIAGNÓSTICO TEMPORÁRIO]
 
 
 def update():
     global _temporizador, pulos_extras, velocidade_vertical, agua_efeito_ativo, altura_olhos_referencia
     global _frame_chuva
+    global _temporizador_debug_respingos, _contador_respingos_criados  # [DIAGNÓSTICO TEMPORÁRIO]
 
     if not jogo_iniciado or tela_carregamento.enabled:
         return
+
+    # [FIX] seguidor_chuva acompanha só a POSIÇÃO de jogador, nunca a
+    # rotação -- ver comentário na criação de seguidor_chuva, lá em cima,
+    # pra entender por que isso conserta os respingos aparecendo debaixo
+    # do chão. Precisa rodar bem no início do frame, antes do bloco de
+    # chuva/respingos mais abaixo usar jogador.x/y/z.
+    seguidor_chuva.position = jogador.position
+
+    # [DIAGNÓSTICO TEMPORÁRIO] atualiza o contador "respingos/seg" na tela
+    # uma vez por segundo e zera pro próximo segundo.
+    _temporizador_debug_respingos += time.dt
+    if _temporizador_debug_respingos >= 1:
+        _texto_debug_respingos.text = f'respingos/seg: {_contador_respingos_criados}'
+        _contador_respingos_criados = 0
+        _temporizador_debug_respingos = 0
 
     for b in mini_blocos_icones:
         b.rotation_y += time.dt * 45
@@ -1617,8 +1898,14 @@ def update():
     chuva.enabled = not cabeca_submersa
     if chuva.enabled:
         for i, g in enumerate(gotas_chuva):
-            if impactos_chuva[i] is None:
+            # [FIX] Recalcula a altura de impacto sempre que a coluna de
+            # MUNDO embaixo dessa gota mudar (o jogador andou pra um lugar
+            # com relevo diferente), não só na primeira vez que a gota
+            # nasce -- ver comentário em colunas_impacto_chuva acima.
+            coluna_atual = (math.floor(jogador.x + g.x), math.floor(jogador.z + g.z))
+            if impactos_chuva[i] is None or colunas_impacto_chuva[i] != coluna_atual:
                 impactos_chuva[i], bloqueios_chuva[i] = calcular_estado_gota(g.x, g.z)
+                colunas_impacto_chuva[i] = coluna_atual
 
             # altura de impacto em coordenada LOCAL (relativa a jogador.y),
             # pra comparar direto com a posição da gota, que também é local.
@@ -1638,6 +1925,7 @@ def update():
                 novo_z = random.uniform(-RAIO_CHUVA, RAIO_CHUVA)
                 gotas_chuva[i] = Vec3(novo_x, ALTURA_CHUVA, novo_z)
                 impactos_chuva[i], bloqueios_chuva[i] = calcular_estado_gota(novo_x, novo_z)
+                colunas_impacto_chuva[i] = (math.floor(jogador.x + novo_x), math.floor(jogador.z + novo_z))
             else:
                 gotas_chuva[i] = Vec3(g.x, nova_altura, g.z)
 
